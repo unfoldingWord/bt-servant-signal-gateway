@@ -1,0 +1,53 @@
+# Mirrors the CI gate (.github/workflows/ci.yml) locally so red code never
+# reaches a commit/push. Hooks run the SAME tools/versions as CI by invoking
+# them through `uv run` (resolved from uv.lock), not pinned mirror repos.
+#
+# Install both hook types once:  uv run pre-commit install
+# (default_install_hook_types below makes that install pre-commit AND pre-push.)
+#
+# Split: fast checks run on every commit; the slower test suite runs on push
+# (so commits stay quick, but nothing red can be pushed).
+
+default_install_hook_types: [pre-commit, pre-push]
+
+repos:
+  - repo: local
+    hooks:
+      # --- CI "lint" job ---
+      - id: ruff-format
+        name: ruff format
+        entry: uv run ruff format
+        language: system
+        types_or: [python, pyi]
+        pass_filenames: false
+      - id: ruff-check
+        name: ruff check
+        entry: uv run ruff check --fix
+        language: system
+        types_or: [python, pyi]
+        pass_filenames: false
+
+      # --- CI "typecheck" job ---
+      - id: ty
+        name: ty check
+        entry: uv run ty check
+        language: system
+        types_or: [python, pyi]
+        pass_filenames: false
+
+      # --- CI "lockfile" job ---
+      - id: uv-lock-check
+        name: uv lock --check
+        entry: uv lock --check
+        language: system
+        files: ^(pyproject\.toml|uv\.lock)$
+        pass_filenames: false
+
+      # --- CI "test" job (push only: keeps commits fast) ---
+      - id: pytest
+        name: pytest
+        entry: uv run pytest
+        language: system
+        types_or: [python, pyi]
+        pass_filenames: false
+        stages: [pre-push]

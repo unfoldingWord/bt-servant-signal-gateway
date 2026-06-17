@@ -46,9 +46,21 @@ src/bt_signal_gateway/
 
 ## Environment variables
 
-Copy `.env.example` → `.env` and fill in. Key vars: `SIGNAL_ACCOUNT`, `SIGNAL_HTTP_URL`,
-`ENGINE_BASE_URL`, `ENGINE_ORG`, `ENGINE_API_KEY`, `GATEWAY_PUBLIC_URL`, `CHUNK_SIZE`,
-`MESSAGE_AGE_CUTOFF_SECONDS`. _(Full table: TODO once config lands.)_
+Copy `.env.example` → `.env` and fill in. Secrets (`ENGINE_API_KEY`) are set as Fly secrets in
+production (`fly secrets set`), never committed.
+
+| Variable | Required | Default | Description |
+|---|---|---|---|
+| `SIGNAL_ACCOUNT` | ✅ | — | The bot's Signal number in E.164 (e.g. `+15551234567`); the linked-device account `signal-cli` runs as. |
+| `SIGNAL_HTTP_URL` |  | `http://127.0.0.1:8080` | Base URL of the local `signal-cli` daemon (JSON-RPC at `/api/v1/rpc`, SSE at `/api/v1/events`). |
+| `ENGINE_BASE_URL` | ✅ | — | Base URL of `bt-servant-worker`. Inbound messages POST to `{ENGINE_BASE_URL}/api/v1/chat/callback`. |
+| `ENGINE_ORG` |  | `unfoldingWord` | Organization slug sent as `org` on each request. |
+| `ENGINE_API_KEY` | ✅ | — | Bearer token for the worker **and** the shared secret the worker echoes back as `X-Engine-Token`. **Secret.** |
+| `GATEWAY_PUBLIC_URL` | ✅ | — | Public URL of *this* gateway. The worker calls back `{GATEWAY_PUBLIC_URL}/progress-callback`. |
+| `CHUNK_SIZE` |  | `1500` | Max characters per outbound Signal message; longer replies are split. |
+| `MESSAGE_AGE_CUTOFF_SECONDS` |  | `3600` | Drop inbound messages older than this (avoids replaying a backlog after downtime). |
+| `SIGNAL_GROUP_ALLOWED_USERS` |  | _(empty)_ | Comma-separated allowed group member ids, or `*` for all. Empty = groups disabled. |
+| `SIGNAL_REQUIRE_MENTION` |  | `true` | In groups, only respond when the bot is @mentioned. |
 
 ## Local development
 
@@ -79,6 +91,32 @@ bootstrap.)_
 
 ## Engine contract
 
-Implements the standard BT Servant gateway contract against `bt-servant-worker`
-(`POST /api/v1/chat/callback` + a `/progress-callback` receiver). See
-[`../bt-servant-worker`](../bt-servant-worker) and CLAUDE.md.
+This gateway implements the standard, channel-neutral BT Servant gateway contract against
+[`bt-servant-worker`](../bt-servant-worker) — **no worker changes are needed for Signal**.
+
+**Inbound (gateway → worker).** `POST {ENGINE_BASE_URL}/api/v1/chat/callback` with
+`Authorization: Bearer {ENGINE_API_KEY}`. Body:
+
+| Field | Value |
+|---|---|
+| `client_id` | `"signal-gateway"` |
+| `user_id` | Signal source UUID (E.164 number fallback) |
+| `message_type` | `"text"` or `"audio"` |
+| `message` / `audio_base64` + `audio_format` | text body, or base64 audio for voice notes |
+| `message_key` | the Signal message timestamp (used for dedup) |
+| `progress_callback_url` | `{GATEWAY_PUBLIC_URL}/progress-callback` |
+| `progress_mode` | `"complete"` — Signal has no message editing, so we want one final reply, not streamed edits |
+| `org` | `ENGINE_ORG` |
+| `chat_type` / `chat_id` / `speaker` | set for group messages (`chat_type="group"`) |
+
+The worker returns `202 Accepted` immediately.
+
+**Outbound (worker → gateway).** The worker POSTs progress to
+`{GATEWAY_PUBLIC_URL}/progress-callback`, guarded by the `X-Engine-Token` header (which must
+equal `ENGINE_API_KEY`). Payloads are typed `status` / `progress` / `complete` / `error`; on
+`complete` the gateway takes `text` (plus any `voice_audio_url` / `attachments[]`), splits it at
+`CHUNK_SIZE`, and sends via the `signal-cli` JSON-RPC `send` method. Because the worker does not
+retry idempotently, the gateway **dedups on `message_key`**.
+
+See [`../bt-servant-worker`](../bt-servant-worker) and [CLAUDE.md](./CLAUDE.md) for the full
+contract.

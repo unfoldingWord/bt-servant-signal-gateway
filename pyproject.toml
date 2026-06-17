@@ -1,0 +1,47 @@
+[project]
+name = "bt-servant-signal-gateway"
+version = "0.1.0"
+description = "Signal messenger gateway for BT Servant — relays messages between Signal (via signal-cli) and bt-servant-worker."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "httpx>=0.27",
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
+    "pydantic>=2.7",
+    "pydantic-settings>=2.3",
+]
+
+[dependency-groups]
+dev = [
+    "ruff>=0.6",
+    "ty>=0.0.1a1",
+    "pytest>=8",
+    "pytest-asyncio>=0.23",
+    "pre-commit>=3.7",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/bt_signal_gateway"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "ASYNC", "RUF"]
+
+[tool.ty.environment]
+python-version = "3.12"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+addopts = "-q -m 'not integration'"
+markers = [
+    "integration: marks tests requiring external services (signal-cli, worker, network)",
+]

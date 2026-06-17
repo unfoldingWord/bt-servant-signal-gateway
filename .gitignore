@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# Virtual environments / uv
+.venv/
+
+# Tooling caches
+.pytest_cache/
+.ruff_cache/
+.ty_cache/
+.mypy_cache/
+
+# Local secrets / env
+.env
+.env.*
+!.env.example
+
+# signal-cli account/session state (never commit)
+signal-cli-data/
+*.d
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/

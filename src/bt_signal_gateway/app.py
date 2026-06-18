@@ -80,8 +80,26 @@ async def run() -> None:
     server.should_exit = True
     listener_task.cancel()
     stop_task.cancel()
-    await asyncio.gather(server_task, listener_task, stop_task, return_exceptions=True)
+    server_result, listener_result, _ = await asyncio.gather(
+        server_task, listener_task, stop_task, return_exceptions=True
+    )
+
+    # We requested the listener's cancellation, so a CancelledError there is
+    # expected; anything else — or any exception from the server — is a real
+    # failure that must surface (non-zero exit + traceback) rather than be
+    # swallowed into a clean-looking shutdown.
+    failures = [
+        (task.get_name(), result)
+        for task, result in ((server_task, server_result), (listener_task, listener_result))
+        if isinstance(result, BaseException) and not isinstance(result, asyncio.CancelledError)
+    ]
+    for name, exc in failures:
+        logger.error("core task failed", extra={"task": name}, exc_info=exc)
+
     logger.info("shutdown complete")
+
+    if failures:
+        raise failures[0][1]
 
 
 def main() -> None:

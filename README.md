@@ -57,6 +57,8 @@ production (`fly secrets set`), never committed.
 | `ENGINE_ORG` |  | `unfoldingWord` | Organization slug sent as `org` on each request. |
 | `ENGINE_API_KEY` | ✅ | — | Bearer token for the worker **and** the shared secret the worker echoes back as `X-Engine-Token`. **Secret.** |
 | `GATEWAY_PUBLIC_URL` | ✅ | — | Public URL of *this* gateway. The worker calls back `{GATEWAY_PUBLIC_URL}/progress-callback`. |
+| `HOST` |  | `0.0.0.0` | Bind address for this gateway's callback server (`/health`, `/progress-callback`). |
+| `PORT` |  | `8081` | Bind port for this gateway's callback server. |
 | `CHUNK_SIZE` |  | `1500` | Max characters per outbound Signal message; longer replies are split. |
 | `MESSAGE_AGE_CUTOFF_SECONDS` |  | `3600` | Drop inbound messages older than this (avoids replaying a backlog after downtime). |
 | `SIGNAL_GROUP_ALLOWED_USERS` |  | _(empty)_ | Comma-separated allowed group member ids, or `*` for all. Empty = groups disabled. |
@@ -67,7 +69,7 @@ production (`fly secrets set`), never committed.
 ```bash
 uv sync                      # install deps into .venv
 cp .env.example .env         # then edit
-uv run python -m bt_signal_gateway   # serves /health (full wiring: TODO)
+uv run python -m bt_signal_gateway   # boots the callback server (/health) + listener (stub); Ctrl-C to stop
 
 # quality gate
 uv run ruff format --check . && uv run ruff check . && uv run ty check && uv run pytest

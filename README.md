@@ -10,7 +10,9 @@ service**, because Signal has no hosted webhook API: it talks to a local
 [`signal-cli`](https://github.com/AsamK/signal-cli) daemon, which needs persistent disk and a
 long-lived connection. See [CLAUDE.md](./CLAUDE.md) for the architecture and rationale.
 
-> Status: **scaffolding**. Only `/health` is implemented; the relay is built out across the
+> Status: **in progress**. `/health` and the outbound signal-cli JSON-RPC client
+> (`signal_client.py` — send, reactions, contacts, attachments) are implemented; the inbound
+> listener and reply dispatch are built out across the
 > issues tracked in the [project epic](https://github.com/unfoldingWord/bt-servant-signal-gateway/issues/11).
 
 ## Architecture

@@ -171,6 +171,18 @@ def test_markdown_fenced_code_preserves_markers() -> None:
     assert markdown_to_signal("```**x**```") == ("**x**", ["0:5:MONOSPACE"])
 
 
+def test_markdown_single_line_fence_keeps_content() -> None:
+    # A single-line fence with no newline must not treat its content as a
+    # language-only tag and drop it.
+    assert markdown_to_signal("```abc```") == ("abc", ["0:3:MONOSPACE"])
+    assert markdown_to_signal("```a b```") == ("a b", ["0:3:MONOSPACE"])
+
+
+def test_markdown_fence_strips_language_tag_with_newline() -> None:
+    # A genuine ```lang\n...``` block still drops the language line.
+    assert markdown_to_signal("```python\nprint(1)```") == ("print(1)", ["0:8:MONOSPACE"])
+
+
 def test_markdown_to_signal_utf16_offsets() -> None:
     # An emoji outside the BMP is two UTF-16 code units; the bold run must
     # report length 2, and a following style must start past it.

@@ -98,7 +98,10 @@ def markdown_to_signal(text: str) -> tuple[str, list[str]]:
     styles: list[tuple[int, int, str]] = []
 
     # --- Phase 1: fenced code blocks  ```...``` -> MONOSPACE ---
-    _cb = re.compile(r"```[a-zA-Z0-9_+-]*\n?(.*?)```", re.DOTALL)
+    # The optional language tag is only consumed when followed by a newline, so
+    # a single-line fence like ``` ```abc``` ``` keeps "abc" as code content
+    # instead of mistaking it for a language-only block and dropping it.
+    _cb = re.compile(r"```(?:[a-zA-Z0-9_+-]*\n)?(.*?)```", re.DOTALL)
     while m := _cb.search(text):
         inner = m.group(1).rstrip("\n")
         start = m.start()

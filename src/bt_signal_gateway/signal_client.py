@@ -126,18 +126,27 @@ def markdown_to_signal(text: str) -> tuple[str, list[str]]:
     # --- Phase 3: inline patterns (single-pass to avoid offset drift) ---
     # Collect ALL non-overlapping matches first, then strip every marker in one
     # pass so positions are computed against the final text.
+    #
+    # Inline code (`` `...` ``) is listed first so it claims its span before the
+    # bold/italic/strike patterns run — that keeps literal markdown markers
+    # *inside* code (e.g. ``**x**``) from being stripped as formatting.
     _patterns = [
+        (re.compile(r"`(.+?)`"), "MONOSPACE"),
         (re.compile(r"\*\*(.+?)\*\*", re.DOTALL), "BOLD"),
         (re.compile(r"__(.+?)__", re.DOTALL), "BOLD"),
         (re.compile(r"~~(.+?)~~", re.DOTALL), "STRIKETHROUGH"),
-        (re.compile(r"`(.+?)`"), "MONOSPACE"),
         (re.compile(r"(?<!\*)\*(?!\*| )(.+?)(?<!\*)\*(?!\*)"), "ITALIC"),
         (re.compile(r"(?<!\w)_(?!_)(.+?)(?<!_)_(?!\w)"), "ITALIC"),
     ]
 
-    # Collect all non-overlapping matches (earlier patterns win ties).
+    # Seed the occupied set with the fenced-code-block ranges recorded in
+    # Phase 1 so the inline patterns below don't reach into already-extracted
+    # code content and strip markers from it (``` ```**x**``` ``` must stay
+    # literal ``**x**``, MONOSPACE, not become BOLD).
     all_matches: list[tuple[int, int, int, int, str]] = []
-    occupied: list[tuple[int, int]] = []
+    occupied: list[tuple[int, int]] = [
+        (s, s + length) for s, length, st in styles if st == "MONOSPACE"
+    ]
     for pat, style in _patterns:
         for m in pat.finditer(text):
             ms, me = m.start(), m.end()

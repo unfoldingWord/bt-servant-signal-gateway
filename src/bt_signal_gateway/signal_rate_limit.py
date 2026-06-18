@@ -223,12 +223,14 @@ class SignalAttachmentScheduler:
         return deficit / self.refill_rate
 
     async def acquire(self, n: int) -> float:
-        """Block until at least ``n`` tokens are available, return the seconds
-        slept.
+        """Reserve ``n`` tokens, blocking until they're available; return the
+        seconds slept.
 
-        Does **not** deduct tokens — the bucket is a read-only model of
-        server-side capacity. Call ``report_rpc_duration()`` after the RPC to
-        synchronise the model with the server timeline.
+        Tokens are **deducted under the lock** before the caller is released, so
+        concurrent acquirers can't all pass the same bucket balance and then
+        overrun the account-level limit (e.g. two simultaneous 30-attachment
+        sends against a 50-token bucket). Call ``report_rpc_duration()`` after
+        the RPC to reset the refill clock past the upload window.
 
         The lock is released during ``asyncio.sleep`` so other callers can
         interleave. A retry loop re-checks after each sleep in case the
@@ -247,9 +249,10 @@ class SignalAttachmentScheduler:
             async with self._lock:
                 self._refill()
                 if self.tokens >= n:
+                    self.tokens -= n  # reserve under the lock before releasing
                     if not first_pass or total_slept > 0:
                         logger.debug(
-                            "Signal scheduler: tokens sufficient for %d "
+                            "Signal scheduler: reserved %d tokens "
                             "(remaining=%.1f, total_slept=%.1fs)",
                             n,
                             self.tokens,
@@ -276,11 +279,12 @@ class SignalAttachmentScheduler:
     async def report_rpc_duration(self, rpc_duration: float, n_attachments: int) -> None:
         """Record an attachment-send RPC that just completed.
 
-        Deducts ``n_attachments`` tokens without crediting refill during the
-        upload window. Signal's server checks the bucket at RPC start and does
-        *not* refill during request processing — refill resumes after the
-        response. Crediting upload-time refill causes cumulative drift that
-        eventually triggers 429s.
+        The ``n_attachments`` tokens were already deducted by ``acquire()``;
+        this only resets the refill clock so the upload window isn't credited as
+        refill. Signal's server checks the bucket at RPC start and does *not*
+        refill during request processing — refill resumes after the response.
+        Crediting upload-time refill causes cumulative drift that eventually
+        triggers 429s.
 
         Advances ``last_refill`` so the next ``acquire`` / ``_refill`` starts
         counting from this point.
@@ -289,19 +293,15 @@ class SignalAttachmentScheduler:
             return
 
         async with self._lock:
-            now = time.monotonic()
             token_before = self.tokens
-            self.tokens = max(0.0, token_before - float(n_attachments))
-            self.last_refill = now
+            self.last_refill = time.monotonic()
         logger.log(
             logging.INFO if rpc_duration > 10 and n_attachments > 5 else logging.DEBUG,
             "Signal scheduler: RPC for %d att took %.1fs — "
-            "tokens %.1f -> %.1f (deducted=%d, no upload refill credited, refill=%.4fs-1)",
+            "tokens %.1f (reserved at acquire, no upload refill credited, refill=%.4fs-1)",
             n_attachments,
             rpc_duration,
             token_before,
-            self.tokens,
-            n_attachments,
             self.refill_rate,
         )
 

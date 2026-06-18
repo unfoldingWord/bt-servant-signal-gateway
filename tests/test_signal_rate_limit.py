@@ -15,17 +15,29 @@ from bt_signal_gateway.signal_rate_limit import (
 )
 
 
-def test_acquire_returns_immediately_when_tokens_available() -> None:
+async def test_acquire_reserves_tokens_under_lock() -> None:
     sched = SignalAttachmentScheduler()
-    # Fresh bucket starts full, so acquiring a small amount sleeps 0s.
+    # Fresh bucket starts full; a small acquire sleeps 0s and deducts the
+    # reserved tokens immediately so concurrent callers can't reuse the balance.
     assert sched.tokens == sched.capacity
+    slept = await sched.acquire(10)
+    assert slept == 0.0
+    assert sched.tokens == pytest.approx(sched.capacity - 10)
 
-    async def _run() -> float:
-        return await sched.acquire(1)
 
+async def test_concurrent_acquires_do_not_overrun_bucket() -> None:
     import asyncio
 
-    assert asyncio.run(_run()) == 0.0
+    # Two simultaneous 30-token sends against a 50-token bucket: the first
+    # reserves 30, the second must wait for refill rather than also passing
+    # against the original balance (the bug the reviewer flagged). Fast refill
+    # keeps the forced wait down to milliseconds.
+    sched = SignalAttachmentScheduler(capacity=50, default_retry_after=0.001)
+    slept = await asyncio.gather(sched.acquire(30), sched.acquire(30))
+    # Exactly one of the two acquired immediately; the other had to sleep.
+    assert sorted(s > 0 for s in slept) == [False, True]
+    # Net reservation never let the modeled bucket go negative.
+    assert sched.tokens >= 0.0
 
 
 async def test_acquire_rejects_more_than_capacity() -> None:
@@ -34,11 +46,14 @@ async def test_acquire_rejects_more_than_capacity() -> None:
         await sched.acquire(6)
 
 
-async def test_report_rpc_duration_deducts_tokens() -> None:
+async def test_report_rpc_duration_only_resets_clock() -> None:
+    # Tokens are deducted at acquire(); report_rpc_duration must not deduct
+    # again (that would double-count the send).
     sched = SignalAttachmentScheduler()
-    before = sched.tokens
+    await sched.acquire(3)
+    after_acquire = sched.tokens
     await sched.report_rpc_duration(1.0, 3)
-    assert sched.tokens == pytest.approx(before - 3.0)
+    assert sched.tokens == pytest.approx(after_acquire)
 
 
 def test_feedback_calibrates_refill_rate_and_drains() -> None:

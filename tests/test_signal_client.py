@@ -160,6 +160,17 @@ def test_markdown_to_signal_styles() -> None:
     assert markdown_to_signal("plain text") == ("plain text", [])
 
 
+def test_markdown_inline_code_preserves_markers() -> None:
+    # Markdown markers inside an inline code span must stay literal, not be
+    # stripped as bold/italic.
+    assert markdown_to_signal("`**x**`") == ("**x**", ["0:5:MONOSPACE"])
+
+
+def test_markdown_fenced_code_preserves_markers() -> None:
+    # Fenced code content must not be re-parsed by the inline formatting pass.
+    assert markdown_to_signal("```**x**```") == ("**x**", ["0:5:MONOSPACE"])
+
+
 def test_markdown_to_signal_utf16_offsets() -> None:
     # An emoji outside the BMP is two UTF-16 code units; the bold run must
     # report length 2, and a following style must start past it.

@@ -64,16 +64,16 @@ async def run() -> None:
         },
     )
 
+    signal_client = SignalClient(settings)
+    engine_client = EngineClient(settings)
+
     config = uvicorn.Config(
-        create_app(),
+        create_app(signal_client=signal_client, settings=settings),
         host=settings.host,
         port=settings.port,
         log_config=None,
     )
     server = _Server(config)
-
-    signal_client = SignalClient(settings)
-    engine_client = EngineClient(settings)
     listener_task = asyncio.create_task(
         run_listener(
             settings,

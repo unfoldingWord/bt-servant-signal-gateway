@@ -16,10 +16,30 @@ import uvicorn
 
 from bt_signal_gateway.callback_server import create_app
 from bt_signal_gateway.config import get_settings
+from bt_signal_gateway.envelope import InboundMessage
 from bt_signal_gateway.logging_config import configure_logging
+from bt_signal_gateway.signal_client import SignalClient
 from bt_signal_gateway.signal_listener import run_listener
 
 logger = logging.getLogger(__name__)
+
+
+async def _log_inbound(message: InboundMessage) -> None:
+    """Placeholder inbound handler until the engine client lands (issue #5).
+
+    Logs accepted messages so the listener path is observable end to end; the
+    real worker relay (``POST /api/v1/chat/callback``) replaces this.
+    """
+    logger.info(
+        "inbound message accepted (not yet relayed to worker)",
+        extra={
+            "user_id": message.user_id,
+            "chat_id": message.chat_id,
+            "is_group": message.is_group,
+            "chars": len(message.text),
+            "attachments": len(message.attachments),
+        },
+    )
 
 
 class _Server(uvicorn.Server):
@@ -56,7 +76,11 @@ async def run() -> None:
     )
     server = _Server(config)
 
-    listener_task = asyncio.create_task(run_listener(settings), name="signal-listener")
+    signal_client = SignalClient(settings)
+    listener_task = asyncio.create_task(
+        run_listener(settings, handler=_log_inbound, signal_client=signal_client),
+        name="signal-listener",
+    )
     server_task = asyncio.create_task(server.serve(), name="callback-server")
 
     loop = asyncio.get_running_loop()
@@ -83,6 +107,7 @@ async def run() -> None:
     server_result, listener_result, _ = await asyncio.gather(
         server_task, listener_task, stop_task, return_exceptions=True
     )
+    await signal_client.aclose()
 
     # We requested the listener's cancellation, so a CancelledError there is
     # expected; anything else — or any exception from the server — is a real

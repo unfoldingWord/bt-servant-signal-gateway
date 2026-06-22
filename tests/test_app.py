@@ -31,7 +31,7 @@ async def test_run_propagates_core_task_failure(
 ) -> None:
     """A crashing core task must make run() raise, not exit cleanly."""
 
-    async def boom(_settings: object) -> None:
+    async def boom(_settings: object, **_kwargs: object) -> None:
         raise RuntimeError("listener crashed")
 
     async def fake_serve(self: object) -> None:

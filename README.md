@@ -10,9 +10,10 @@ service**, because Signal has no hosted webhook API: it talks to a local
 [`signal-cli`](https://github.com/AsamK/signal-cli) daemon, which needs persistent disk and a
 long-lived connection. See [CLAUDE.md](./CLAUDE.md) for the architecture and rationale.
 
-> Status: **in progress**. `/health` and the outbound signal-cli JSON-RPC client
-> (`signal_client.py` — send, reactions, contacts, attachments) are implemented; the inbound
-> listener and reply dispatch are built out across the
+> Status: **in progress**. `/health`, the outbound signal-cli JSON-RPC client
+> (`signal_client.py` — send, reactions, contacts, attachments), and the inbound SSE listener
+> (`signal_listener.py` + `envelope.py` — parse, filter, normalize) are implemented; relaying
+> accepted messages to the worker and reply dispatch are built out across the
 > issues tracked in the [project epic](https://github.com/unfoldingWord/bt-servant-signal-gateway/issues/11).
 
 ## Architecture
@@ -71,7 +72,7 @@ production (`fly secrets set`), never committed.
 ```bash
 uv sync                      # install deps into .venv
 cp .env.example .env         # then edit
-uv run python -m bt_signal_gateway   # boots the callback server (/health) + listener (stub); Ctrl-C to stop
+uv run python -m bt_signal_gateway   # boots the callback server (/health) + inbound SSE listener; Ctrl-C to stop
 
 # quality gate
 uv run ruff format --check . && uv run ruff check . && uv run ty check && uv run pytest

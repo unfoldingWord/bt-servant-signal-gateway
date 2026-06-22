@@ -119,10 +119,15 @@ The worker returns `202 Accepted` immediately.
 
 **Outbound (worker → gateway).** The worker POSTs progress to
 `{GATEWAY_PUBLIC_URL}/progress-callback`, guarded by the `X-Engine-Token` header (which must
-equal `ENGINE_API_KEY`). Payloads are typed `status` / `progress` / `complete` / `error`; on
-`complete` the gateway takes `text` (plus any `voice_audio_url` / `attachments[]`), splits it at
-`CHUNK_SIZE`, and sends via the `signal-cli` JSON-RPC `send` method. Because the worker does not
-retry idempotently, the gateway **dedups on `message_key`**.
+equal `ENGINE_API_KEY`; a missing/wrong token gets `401`). Payloads are typed `status` /
+`progress` / `complete` / `error`. The gateway acks quickly and delivers off the ack path, so a
+slow signal-cli send never blocks the worker's webhook. `status`/`progress` are ignored (Signal
+has no in-place message editing); on `complete` it splits `text` at `CHUNK_SIZE` and sends each
+chunk via the `signal-cli` JSON-RPC `send` method; on `error` it sends a fixed fallback message.
+Replies route to the originating group (`chat_id`) or DM (`user_id`). Because the worker does not
+retry idempotently, the gateway **dedups `complete` on `message_key`**. Media on `complete`
+(`voice_audio_url` / `attachments[]`) is accepted but not yet delivered — that lands with media
+handling (issue #7).
 
 See [`../bt-servant-worker`](../bt-servant-worker) and [CLAUDE.md](./CLAUDE.md) for the full
 contract.

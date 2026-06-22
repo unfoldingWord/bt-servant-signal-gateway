@@ -11,9 +11,10 @@ service**, because Signal has no hosted webhook API: it talks to a local
 long-lived connection. See [CLAUDE.md](./CLAUDE.md) for the architecture and rationale.
 
 > Status: **in progress**. `/health`, the outbound signal-cli JSON-RPC client
-> (`signal_client.py` — send, reactions, contacts, attachments), and the inbound SSE listener
-> (`signal_listener.py` + `envelope.py` — parse, filter, normalize) are implemented; relaying
-> accepted messages to the worker and reply dispatch are built out across the
+> (`signal_client.py` — send, reactions, contacts, attachments), the inbound SSE listener
+> (`signal_listener.py` + `envelope.py` — parse, filter, normalize), and the engine client
+> (`engine_client.py` — relays accepted messages to the worker via `POST /api/v1/chat/callback`,
+> wired into the listener) are implemented; reply dispatch is built out across the
 > issues tracked in the [project epic](https://github.com/unfoldingWord/bt-servant-signal-gateway/issues/11).
 
 ## Architecture

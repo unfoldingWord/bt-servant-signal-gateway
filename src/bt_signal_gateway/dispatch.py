@@ -104,13 +104,19 @@ async def dispatch_callback(
     payload: CallbackPayload,
     signal_client: SignalClient,
     settings: Settings,
-) -> None:
+) -> bool:
     """Deliver a terminal (``complete`` / ``error``) callback to Signal.
 
     ``complete`` chunks ``text`` to ``CHUNK_SIZE`` and sends each chunk in order;
     an empty/blank reply sends nothing. ``error`` sends the fallback message.
     Other types are no-ops (the server layer already filters them). Per-chunk
     send failures are logged but do not abort the remaining chunks.
+
+    Returns ``True`` when delivery is fully accounted for (every chunk sent, the
+    fallback sent, or there was nothing to send) and ``False`` when any send
+    failed. The caller uses this to decide whether to mark the ``message_key``
+    as completed: a ``False`` leaves the key eligible for re-delivery so a
+    repeated callback can finish the reply.
     """
     recipient = _recipient(payload)
     log_ctx = {
@@ -122,17 +128,16 @@ async def dispatch_callback(
 
     if payload.type == "error":
         logger.error("callback: worker reported error", extra={**log_ctx, "error": payload.error})
-        await signal_client.send(recipient, DEFAULT_FALLBACK_MESSAGE)
-        return
+        return await signal_client.send(recipient, DEFAULT_FALLBACK_MESSAGE)
 
     if payload.type != "complete":
         logger.debug("callback: ignoring non-terminal type", extra=log_ctx)
-        return
+        return True
 
     chunks = chunk_message(payload.text or "", settings.chunk_size)
     if not chunks:
         logger.info("callback: complete with empty text, nothing to send", extra=log_ctx)
-        return
+        return True
 
     logger.info("callback: dispatching complete", extra={**log_ctx, "chunks": len(chunks)})
     sent = 0
@@ -145,6 +150,9 @@ async def dispatch_callback(
                 extra={**log_ctx, "chunk_index": index, "chunk_count": len(chunks)},
             )
 
+    fully_delivered = sent == len(chunks)
     logger.info(
-        "callback: complete dispatched", extra={**log_ctx, "sent": sent, "expected": len(chunks)}
+        "callback: complete dispatched",
+        extra={**log_ctx, "sent": sent, "expected": len(chunks), "delivered": fully_delivered},
     )
+    return fully_delivered

@@ -28,8 +28,11 @@ def _settings() -> Settings:
 
 
 class _FakeSignalClient:
-    def __init__(self) -> None:
+    """Records ``send`` calls; returns ``True`` (or a queued per-call result)."""
+
+    def __init__(self, results: list[bool] | None = None) -> None:
         self.sends: list[tuple[str, str]] = []
+        self._results = list(results) if results is not None else None
 
     async def send(
         self,
@@ -39,11 +42,13 @@ class _FakeSignalClient:
         text_styles: list[str] | None = None,
     ) -> bool:
         self.sends.append((chat_id, message))
-        return True
+        if self._results is None:
+            return True
+        return self._results.pop(0) if self._results else True
 
 
-def _client() -> tuple[_FakeSignalClient, TestClient]:
-    fake = _FakeSignalClient()
+def _client(results: list[bool] | None = None) -> tuple[_FakeSignalClient, TestClient]:
+    fake = _FakeSignalClient(results)
     app = create_app(signal_client=cast(SignalClient, fake), settings=_settings())
     # TestClient runs background tasks before returning, so sends are observable.
     return fake, TestClient(app)
@@ -97,6 +102,19 @@ def test_duplicate_complete_delivered_once() -> None:
     assert _post(client, _complete_body("dup")).status_code == 200
     assert _post(client, _complete_body("dup")).status_code == 200
     assert fake.sends == [(USER_ID, "hello there")]
+
+
+def test_failed_delivery_leaves_key_redeliverable() -> None:
+    # First send fails (key stays uncompleted), retry succeeds, third is a dupe.
+    fake, client = _client(results=[False, True])
+    assert _post(client, _complete_body("retry")).status_code == 200
+    assert len(fake.sends) == 1  # one failed attempt, key NOT marked complete
+
+    assert _post(client, _complete_body("retry")).status_code == 200
+    assert len(fake.sends) == 2  # re-delivered because the first attempt failed
+
+    assert _post(client, _complete_body("retry")).status_code == 200
+    assert len(fake.sends) == 2  # now completed → subsequent duplicate ignored
 
 
 def test_error_sends_fallback() -> None:

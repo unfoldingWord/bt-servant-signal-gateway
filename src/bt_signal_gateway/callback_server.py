@@ -2,10 +2,17 @@
 
 Exposes ``GET /health`` and ``POST /progress-callback`` — the worker -> gateway
 reply path. The callback handler authenticates the worker (``X-Engine-Token``
-against ``ENGINE_API_KEY``), parses the payload, dedups ``complete`` events on
-``message_key``, then schedules delivery to Signal as a background task so the
-worker's ack returns immediately (the worker's webhook post is non-blocking and
-short-timeout; we must not hold it open while sending to signal-cli).
+against ``ENGINE_API_KEY``), parses the payload, then schedules delivery to
+Signal as a background task so the worker's ack returns immediately (the
+worker's webhook post is non-blocking and short-timeout; we must not hold it
+open while sending to signal-cli).
+
+``complete`` callbacks are deduped on ``message_key`` with a deliver-then-mark
+discipline: a key is marked *completed* only after delivery fully succeeds, and
+an in-flight set blocks concurrent duplicates while the first attempt is still
+running. A failed/partial send leaves the key neither completed nor in-flight,
+so a repeated callback is free to re-deliver the reply rather than being
+silently dropped.
 
 Dependencies (``signal_client``, ``settings``, ``dedup``) are injected into
 :func:`create_app` and stashed on ``app.state``. The module-level ``app`` keeps
@@ -21,7 +28,7 @@ from fastapi import BackgroundTasks, FastAPI, Request, Response
 
 from bt_signal_gateway.config import Settings, get_settings
 from bt_signal_gateway.dedup import CompletedKeys
-from bt_signal_gateway.dispatch import dispatch_callback, parse_callback_payload
+from bt_signal_gateway.dispatch import CallbackPayload, dispatch_callback, parse_callback_payload
 from bt_signal_gateway.signal_client import SignalClient
 
 logger = logging.getLogger(__name__)
@@ -31,6 +38,34 @@ SERVICE_NAME = "bt-servant-signal-gateway"
 #: TTL for the ``complete`` dedup cache. Generous relative to a request's
 #: lifetime; only needs to outlive any worker re-delivery window.
 _DEDUP_TTL_MS = 10 * 60 * 1000.0
+
+
+async def _deliver_and_mark(
+    payload: CallbackPayload,
+    signal_client: SignalClient,
+    settings: Settings,
+    dedup: CompletedKeys,
+    in_flight: set[str],
+) -> None:
+    """Deliver a ``complete`` callback, marking its key done only on success.
+
+    Marks ``message_key`` completed only when :func:`dispatch_callback` confirms
+    full delivery; a failed/partial send (or a raised error) leaves the key
+    unmarked so a repeated callback can retry. The in-flight reservation is
+    always released so a later attempt isn't permanently blocked.
+    """
+    key = payload.message_key
+    try:
+        delivered = await dispatch_callback(payload, signal_client, settings)
+    except Exception:
+        logger.exception("callback: delivery raised; key left re-deliverable", extra={"key": key})
+        delivered = False
+
+    if delivered:
+        dedup.mark_completed(key)
+    else:
+        logger.warning("callback: delivery incomplete; key left re-deliverable", extra={"key": key})
+    in_flight.discard(key)
 
 
 def create_app(
@@ -50,6 +85,8 @@ def create_app(
     app.state.signal_client = signal_client
     app.state.settings = settings
     app.state.dedup = dedup or CompletedKeys(ttl_ms=_DEDUP_TTL_MS)
+    # message_keys whose delivery is currently running (blocks concurrent dupes).
+    app.state.in_flight = set()
 
     @app.get("/health")
     async def health() -> dict[str, object]:
@@ -80,16 +117,6 @@ def create_app(
         if payload.type not in ("complete", "error"):
             return Response(status_code=200)
 
-        if payload.type == "complete":
-            dedup: CompletedKeys = app.state.dedup
-            if dedup.is_completed(payload.message_key):
-                logger.info(
-                    "callback: duplicate complete ignored",
-                    extra={"message_key": payload.message_key, "user_id": payload.user_id},
-                )
-                return Response(status_code=200)
-            dedup.mark_completed(payload.message_key)
-
         signal_client: SignalClient | None = app.state.signal_client
         if signal_client is None:
             logger.error(
@@ -98,8 +125,27 @@ def create_app(
             )
             return Response(status_code=503)
 
-        # Deliver off the ack path so the worker's webhook post returns fast.
-        background.add_task(dispatch_callback, payload, signal_client, settings)
+        # error: fire-and-forget the fallback message (not deduped).
+        if payload.type == "error":
+            background.add_task(dispatch_callback, payload, signal_client, settings)
+            return Response(status_code=200)
+
+        # complete: dedup on message_key, marking done only after delivery
+        # succeeds (in _deliver_and_mark). is_completed covers finished replies;
+        # in_flight covers one that's still being delivered.
+        dedup: CompletedKeys = app.state.dedup
+        in_flight: set[str] = app.state.in_flight
+        key = payload.message_key
+        if dedup.is_completed(key) or key in in_flight:
+            logger.info(
+                "callback: duplicate complete ignored",
+                extra={"message_key": key, "user_id": payload.user_id},
+            )
+            return Response(status_code=200)
+
+        # Reserve before scheduling so a concurrent duplicate can't slip past.
+        in_flight.add(key)
+        background.add_task(_deliver_and_mark, payload, signal_client, settings, dedup, in_flight)
         return Response(status_code=200)
 
     return app

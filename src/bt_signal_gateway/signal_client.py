@@ -25,9 +25,12 @@ import httpx
 
 from bt_signal_gateway.config import Settings
 from bt_signal_gateway.signal_rate_limit import (
+    SIGNAL_BATCH_PACING_NOTICE_THRESHOLD,
+    SIGNAL_MAX_ATTACHMENTS_PER_MSG,
     SIGNAL_RATE_LIMIT_MAX_ATTEMPTS,
     SignalRateLimitError,
     _extract_retry_after_seconds,
+    _format_wait,
     _is_signal_rate_limit_error,
     _signal_send_timeout,
     get_scheduler,
@@ -418,14 +421,22 @@ class SignalClient:
         return result is not None
 
     async def _send_with_attachments(self, params: dict[str, Any], attachments: list[str]) -> bool:
-        """Send a single message carrying attachments, paced by the rate-limit
-        scheduler with 429 backoff-retry.
+        """Send a single message carrying attachments (one RPC).
 
-        This is the single-message path; the multi-batch image sender lands with
-        media handling (issue #7).
+        Used by :meth:`send` for the text-with-attachments case; the multi-batch
+        outbound media senders below build on the same paced primitive.
         """
-        n = len(attachments)
         params = dict(params, attachments=attachments)
+        return await self._send_attachment_batch(params, len(attachments))
+
+    async def _send_attachment_batch(self, params: dict[str, Any], n: int) -> bool:
+        """Send one already-built attachment-carrying ``send`` RPC, paced by the
+        rate-limit scheduler with 429 backoff-retry.
+
+        ``params`` must already include ``attachments`` and a resolved
+        destination; ``n`` is the attachment count (drives the scheduler reserve
+        and the upload-scaled timeout). Returns True on a successful send.
+        """
         scheduler = get_scheduler()
         send_timeout = _signal_send_timeout(n)
 
@@ -457,6 +468,71 @@ class SignalClient:
                     extra={"attempt": attempt, "retry_after": exc.retry_after},
                 )
         return False
+
+    # ------------------------------------------------------------------
+    # Outbound media (voice notes + file attachments)
+    # ------------------------------------------------------------------
+
+    async def send_voice_note(self, chat_id: str, file_path: str) -> bool:
+        """Send a single audio file as a playable Signal voice note.
+
+        signal-cli's ``voiceNote`` flag marks the lone attachment as an inline
+        playable voice message rather than a generic file. Paced like any other
+        attachment send.
+        """
+        params: dict[str, Any] = {
+            "account": self._account,
+            "message": "",
+            "attachments": [file_path],
+            "voiceNote": True,
+        }
+        await self._apply_destination(params, chat_id)
+        return await self._send_attachment_batch(params, 1)
+
+    async def send_attachments(
+        self, chat_id: str, file_paths: list[str], message: str = ""
+    ) -> bool:
+        """Send file attachments, split into ``SIGNAL_MAX_ATTACHMENTS_PER_MSG``
+        (32) per RPC and paced by the rate-limit scheduler.
+
+        The optional caption *message* rides only on the first batch. Returns
+        True only if every batch is delivered; an empty list is a no-op success.
+        """
+        if not file_paths:
+            return True
+
+        base_params: dict[str, Any] = {"account": self._account}
+        await self._apply_destination(base_params, chat_id)
+
+        scheduler = get_scheduler()
+        batches = [
+            file_paths[i : i + SIGNAL_MAX_ATTACHMENTS_PER_MSG]
+            for i in range(0, len(file_paths), SIGNAL_MAX_ATTACHMENTS_PER_MSG)
+        ]
+        all_ok = True
+        for idx, batch in enumerate(batches):
+            n = len(batch)
+            wait = scheduler.estimate_wait(n)
+            if wait >= SIGNAL_BATCH_PACING_NOTICE_THRESHOLD:
+                await self._notify_batch_pacing(chat_id, idx + 1, len(batches), wait)
+            params = dict(base_params, message=message if idx == 0 else "", attachments=batch)
+            if not await self._send_attachment_batch(params, n):
+                all_ok = False
+        return all_ok
+
+    async def _notify_batch_pacing(
+        self, chat_id: str, next_batch_idx: int, total_batches: int, wait_s: float
+    ) -> None:
+        """Tell the user when an inter-batch pacing wait crosses the notice
+        threshold. Best-effort; logs and continues on failure."""
+        try:
+            await self.send(
+                chat_id,
+                f"(More files coming — pausing ~{_format_wait(wait_s)} for Signal "
+                f"rate limit, batch {next_batch_idx}/{total_batches}.)",
+            )
+        except Exception as exc:  # informational only — never fail the send
+            logger.warning("signal: failed to send pacing notice", extra={"error": str(exc)})
 
     # ------------------------------------------------------------------
     # Reactions (progress indicators)

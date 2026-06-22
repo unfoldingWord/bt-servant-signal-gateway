@@ -11,11 +11,12 @@ service**, because Signal has no hosted webhook API: it talks to a local
 long-lived connection. See [CLAUDE.md](./CLAUDE.md) for the architecture and rationale.
 
 > Status: **in progress**. `/health`, the outbound signal-cli JSON-RPC client
-> (`signal_client.py` — send, reactions, contacts, attachments), the inbound SSE listener
-> (`signal_listener.py` + `envelope.py` — parse, filter, normalize), and the engine client
-> (`engine_client.py` — relays accepted messages to the worker via `POST /api/v1/chat/callback`,
-> wired into the listener) are implemented; reply dispatch is built out across the
-> issues tracked in the [project epic](https://github.com/unfoldingWord/bt-servant-signal-gateway/issues/11).
+> (`signal_client.py` — send, reactions, contacts, attachments, voice notes), the inbound SSE
+> listener (`signal_listener.py` + `envelope.py` — parse, filter, normalize), the engine client
+> (`engine_client.py` — relays accepted messages to the worker via `POST /api/v1/chat/callback`),
+> reply dispatch (`callback_server.py` + `dispatch.py`), and media handling (`media.py` — inbound
+> audio + outbound voice/attachments) are implemented. Remaining work (containerization, Fly.io
+> deploy) is tracked in the [project epic](https://github.com/unfoldingWord/bt-servant-signal-gateway/issues/11).
 
 ## Architecture
 
@@ -37,7 +38,8 @@ src/bt_signal_gateway/
 ├── envelope.py       # Signal envelope → InboundMessage
 ├── engine_client.py  # POST /api/v1/chat/callback (worker contract)
 ├── callback_server.py# FastAPI: /health, /progress-callback
-├── dispatch.py       # worker callback → Signal reply
+├── dispatch.py       # worker callback → Signal reply (text + media)
+├── media.py          # inbound audio encode + outbound media download
 ├── chunking.py       # message splitting
 └── dedup.py          # message_key TTL dedup
 ```
@@ -125,9 +127,15 @@ slow signal-cli send never blocks the worker's webhook. `status`/`progress` are 
 has no in-place message editing); on `complete` it splits `text` at `CHUNK_SIZE` and sends each
 chunk via the `signal-cli` JSON-RPC `send` method; on `error` it sends a fixed fallback message.
 Replies route to the originating group (`chat_id`) or DM (`user_id`). Because the worker does not
-retry idempotently, the gateway **dedups `complete` on `message_key`**. Media on `complete`
-(`voice_audio_url` / `attachments[]`) is accepted but not yet delivered — that lands with media
-handling (issue #7).
+retry idempotently, the gateway **dedups `complete` on `message_key`**.
+
+Media on `complete` is delivered after the text: a `voice_audio_url` (with `voice_audio_base64`
+fallback) is sent as a playable Signal **voice note**, and `attachments[]` (pdf/audio) are sent as
+file attachments (batched ≤32 per RPC, paced by the attachment rate-limit scheduler). All media is
+downloaded HTTPS-only with the engine bearer token to a temp workspace signal-cli reads off the
+shared volume, then cleaned up. Inbound audio attachments are fetched, base64-encoded, and sent to
+the worker as an `audio` request; **non-audio inbound attachments are not yet relayed** (the
+worker's inbound contract is text/audio only) — tracked separately.
 
 See [`../bt-servant-worker`](../bt-servant-worker) and [CLAUDE.md](./CLAUDE.md) for the full
 contract.

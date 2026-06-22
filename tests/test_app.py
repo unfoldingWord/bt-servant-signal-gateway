@@ -3,11 +3,16 @@
 from __future__ import annotations
 
 import asyncio
+from typing import cast
 
 import pytest
 
 from bt_signal_gateway import app as app_module
-from bt_signal_gateway.config import get_settings
+from bt_signal_gateway.config import Settings, get_settings
+from bt_signal_gateway.engine_client import EngineClient
+from bt_signal_gateway.envelope import AttachmentRef, InboundMessage
+from bt_signal_gateway.media import InboundAudio
+from bt_signal_gateway.signal_client import SignalClient
 
 REQUIRED_ENV = {
     "SIGNAL_ACCOUNT": "+15551234567",
@@ -24,6 +29,66 @@ def _env(monkeypatch: pytest.MonkeyPatch) -> None:
     get_settings.cache_clear()
     # Keep the test from clobbering pytest's logging config.
     monkeypatch.setattr(app_module, "configure_logging", lambda *a, **k: None)
+
+
+def _settings() -> Settings:
+    return Settings(
+        _env_file=None,  # type: ignore  # pydantic-settings runtime kwarg, not a model field
+        signal_account="+15551234567",
+        engine_base_url="https://api.btservant.ai",
+        engine_api_key="secret-token",
+        gateway_public_url="https://gw.fly.dev",
+    )
+
+
+class _FakeEngine:
+    def __init__(self) -> None:
+        self.calls: list[InboundAudio | None] = []
+
+    async def submit(self, _message: InboundMessage, *, audio: InboundAudio | None = None) -> bool:
+        self.calls.append(audio)
+        return True
+
+
+class _FakeSignal:
+    def __init__(self, data: bytes | None = b"voice") -> None:
+        self._data = data
+
+    async def get_attachment(self, _attachment_id: str) -> bytes | None:
+        return self._data
+
+
+def _message(attachments: list[AttachmentRef]) -> InboundMessage:
+    return InboundMessage(
+        user_id="u",
+        chat_id="u",
+        text="caption",
+        timestamp_ms=1700000000000,
+        attachments=attachments,
+    )
+
+
+async def test_inbound_handler_fetches_audio_attachment() -> None:
+    engine = _FakeEngine()
+    handler = app_module._make_inbound_handler(
+        cast(EngineClient, engine), cast(SignalClient, _FakeSignal()), _settings()
+    )
+    await handler(_message([AttachmentRef(id="a", content_type="audio/aac")]))
+
+    assert len(engine.calls) == 1
+    audio = engine.calls[0]
+    assert audio is not None and audio.audio_format == "aac"
+
+
+async def test_inbound_handler_ignores_non_audio_attachment() -> None:
+    engine = _FakeEngine()
+    handler = app_module._make_inbound_handler(
+        cast(EngineClient, engine), cast(SignalClient, _FakeSignal()), _settings()
+    )
+    await handler(_message([AttachmentRef(id="img", content_type="image/png")]))
+
+    # Submitted as a plain text message — no audio fetched.
+    assert engine.calls == [None]
 
 
 async def test_run_propagates_core_task_failure(

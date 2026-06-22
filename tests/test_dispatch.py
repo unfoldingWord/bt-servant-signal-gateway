@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import base64
 from typing import cast
 
+import httpx
 import pytest
 
 from bt_signal_gateway.config import Settings
@@ -13,6 +15,7 @@ from bt_signal_gateway.dispatch import (
     dispatch_callback,
     parse_callback_payload,
 )
+from bt_signal_gateway.media import OutboundAttachment
 from bt_signal_gateway.signal_client import SignalClient
 
 ACCOUNT = "+15551234567"
@@ -32,11 +35,21 @@ def _settings(chunk_size: int = 1500) -> Settings:
 
 
 class _FakeSignalClient:
-    """Records ``send`` calls; returns ``True`` (or a queued failure)."""
+    """Records ``send`` / media calls; returns ``True`` (or a queued failure)."""
 
-    def __init__(self, results: list[bool] | None = None) -> None:
+    def __init__(
+        self,
+        results: list[bool] | None = None,
+        *,
+        voice_ok: bool = True,
+        attachments_ok: bool = True,
+    ) -> None:
         self.sends: list[tuple[str, str]] = []
+        self.voice_notes: list[tuple[str, str]] = []
+        self.attachment_sends: list[tuple[str, list[str]]] = []
         self._results = list(results) if results is not None else None
+        self._voice_ok = voice_ok
+        self._attachments_ok = attachments_ok
 
     async def send(
         self,
@@ -50,10 +63,37 @@ class _FakeSignalClient:
             return True
         return self._results.pop(0) if self._results else True
 
+    async def send_voice_note(self, chat_id: str, file_path: str) -> bool:
+        self.voice_notes.append((chat_id, file_path))
+        return self._voice_ok
 
-def _client(results: list[bool] | None = None) -> tuple[_FakeSignalClient, SignalClient]:
-    fake = _FakeSignalClient(results)
+    async def send_attachments(
+        self, chat_id: str, file_paths: list[str], message: str = ""
+    ) -> bool:
+        self.attachment_sends.append((chat_id, list(file_paths)))
+        return self._attachments_ok
+
+
+def _client(
+    results: list[bool] | None = None,
+    *,
+    voice_ok: bool = True,
+    attachments_ok: bool = True,
+) -> tuple[_FakeSignalClient, SignalClient]:
+    fake = _FakeSignalClient(results, voice_ok=voice_ok, attachments_ok=attachments_ok)
     return fake, cast(SignalClient, fake)
+
+
+def _http_client(routes: dict[str, httpx.Response]) -> httpx.AsyncClient:
+    """A mock httpx client mapping ``url -> response`` for media downloads."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        resp = routes.get(str(request.url))
+        if resp is None:
+            return httpx.Response(404)
+        return httpx.Response(resp.status_code, content=resp.content)
+
+    return httpx.AsyncClient(transport=httpx.MockTransport(handler))
 
 
 # --- parse_callback_payload ---
@@ -156,3 +196,133 @@ async def test_chunk_send_failure_does_not_abort_remaining_chunks() -> None:
     await dispatch_callback(payload, client, _settings(chunk_size=8))
     # First chunk "fails" but the dispatcher still attempts the rest.
     assert len(fake.sends) >= 2
+
+
+# --- parse_callback_payload: media fields ---
+
+
+def test_parse_populates_media_fields() -> None:
+    payload = parse_callback_payload(
+        {
+            "type": "complete",
+            "user_id": USER_ID,
+            "message_key": "k1",
+            "voice_audio_url": "https://w/reply.m4a",
+            "voice_audio_base64": "QUJD",
+            "attachments": [{"type": "pdf", "url": "https://w/a.pdf", "filename": "a.pdf"}],
+        }
+    )
+    assert payload is not None
+    assert payload.voice_audio_url == "https://w/reply.m4a"
+    assert payload.voice_audio_base64 == "QUJD"
+    assert payload.attachments == [OutboundAttachment(url="https://w/a.pdf", filename="a.pdf")]
+
+
+# --- dispatch_callback: outbound media ---
+
+
+async def test_complete_with_voice_url_sends_voice_note() -> None:
+    fake, client = _client()
+    url = "https://w/reply.m4a"
+    payload = CallbackPayload(
+        type="complete", user_id=USER_ID, message_key="k1", voice_audio_url=url
+    )
+    http = _http_client({url: httpx.Response(200, content=b"voice-bytes")})
+    try:
+        ok = await dispatch_callback(payload, client, _settings(), http_client=http)
+    finally:
+        await http.aclose()
+
+    assert ok is True
+    assert len(fake.voice_notes) == 1
+    recipient, path = fake.voice_notes[0]
+    assert recipient == USER_ID
+    assert path.endswith("reply.m4a")
+    assert fake.sends == []  # no text in this reply
+
+
+async def test_voice_url_failure_falls_back_to_base64() -> None:
+    fake, client = _client()
+    url = "https://w/reply.m4a"
+    payload = CallbackPayload(
+        type="complete",
+        user_id=USER_ID,
+        message_key="k1",
+        voice_audio_url=url,
+        voice_audio_base64=base64.b64encode(b"fallback-bytes").decode(),
+    )
+    # URL 404s -> base64 path is used.
+    http = _http_client({url: httpx.Response(404)})
+    try:
+        ok = await dispatch_callback(payload, client, _settings(), http_client=http)
+    finally:
+        await http.aclose()
+
+    assert ok is True
+    assert len(fake.voice_notes) == 1
+    assert fake.voice_notes[0][1].endswith("voice.m4a")
+
+
+async def test_complete_with_attachments_sends_them() -> None:
+    fake, client = _client()
+    payload = CallbackPayload(
+        type="complete",
+        user_id=USER_ID,
+        message_key="k1",
+        text="here are your files",
+        attachments=[
+            OutboundAttachment(url="https://w/a.pdf", filename="a.pdf"),
+            OutboundAttachment(url="https://w/b.pdf", filename="b.pdf"),
+        ],
+    )
+    http = _http_client(
+        {
+            "https://w/a.pdf": httpx.Response(200, content=b"pdf-a"),
+            "https://w/b.pdf": httpx.Response(200, content=b"pdf-b"),
+        }
+    )
+    try:
+        ok = await dispatch_callback(payload, client, _settings(), http_client=http)
+    finally:
+        await http.aclose()
+
+    assert ok is True
+    assert fake.sends == [(USER_ID, "here are your files")]
+    assert len(fake.attachment_sends) == 1
+    recipient, paths = fake.attachment_sends[0]
+    assert recipient == USER_ID
+    assert [p.split("/")[-1] for p in paths] == ["a.pdf", "b.pdf"]
+
+
+async def test_voice_send_failure_marks_incomplete() -> None:
+    _fake, client = _client(voice_ok=False)
+    url = "https://w/reply.m4a"
+    payload = CallbackPayload(
+        type="complete", user_id=USER_ID, message_key="k1", voice_audio_url=url
+    )
+    http = _http_client({url: httpx.Response(200, content=b"voice-bytes")})
+    try:
+        ok = await dispatch_callback(payload, client, _settings(), http_client=http)
+    finally:
+        await http.aclose()
+
+    # send_voice_note returned False -> key stays re-deliverable.
+    assert ok is False
+
+
+async def test_attachment_download_failure_marks_incomplete() -> None:
+    fake, client = _client()
+    payload = CallbackPayload(
+        type="complete",
+        user_id=USER_ID,
+        message_key="k1",
+        attachments=[OutboundAttachment(url="https://w/missing.pdf", filename="m.pdf")],
+    )
+    http = _http_client({})  # every URL 404s
+    try:
+        ok = await dispatch_callback(payload, client, _settings(), http_client=http)
+    finally:
+        await http.aclose()
+
+    assert ok is False
+    assert fake.attachment_sends == []  # nothing downloaded -> nothing sent

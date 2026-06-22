@@ -29,6 +29,8 @@ logger = logging.getLogger(__name__)
 
 # per-message attachment cap (source: Signal-{Android,Desktop} source code)
 SIGNAL_MAX_ATTACHMENTS_PER_MSG = 32
+# per-attachment size cap enforced by Signal-Server (100 MiB)
+SIGNAL_MAX_ATTACHMENT_SIZE = 100 * 1024 * 1024
 # server-side token-bucket capacity for attachments rate limiting
 SIGNAL_RATE_LIMIT_BUCKET_CAPACITY = 50
 # fallback token refill interval for signal-cli < v0.14.3

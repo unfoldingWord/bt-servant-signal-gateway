@@ -15,21 +15,49 @@ from contextlib import suppress
 import uvicorn
 
 from bt_signal_gateway.callback_server import create_app
-from bt_signal_gateway.config import get_settings
+from bt_signal_gateway.config import Settings, get_settings
 from bt_signal_gateway.engine_client import EngineClient
 from bt_signal_gateway.envelope import InboundMessage
 from bt_signal_gateway.logging_config import configure_logging
+from bt_signal_gateway.media import fetch_inbound_audio, select_inbound_audio
 from bt_signal_gateway.signal_client import SignalClient
 from bt_signal_gateway.signal_listener import InboundHandler, run_listener
 
 logger = logging.getLogger(__name__)
 
 
-def _make_inbound_handler(engine_client: EngineClient) -> InboundHandler:
-    """Build the listener handler that relays accepted messages to the worker."""
+def _make_inbound_handler(
+    engine_client: EngineClient,
+    signal_client: SignalClient,
+    settings: Settings,
+) -> InboundHandler:
+    """Build the listener handler that relays accepted messages to the worker.
+
+    An inbound audio attachment is fetched + base64-encoded so the worker gets an
+    ``audio`` request; other attachment types can't be relayed to the worker yet
+    (its inbound contract is text/audio only), so they're dropped with a log and
+    any caption text still goes through as a text message.
+    """
 
     async def _relay(message: InboundMessage) -> None:
-        if not await engine_client.submit(message):
+        audio = None
+        if message.attachments:
+            ref = select_inbound_audio(message.attachments)
+            if ref is not None:
+                audio = await fetch_inbound_audio(ref, signal_client)
+                if audio is None:
+                    logger.warning(
+                        "inbound audio could not be fetched; relaying as text",
+                        extra={"user_id": message.user_id, "chat_id": message.chat_id},
+                    )
+            non_audio = len(message.attachments) - (1 if ref is not None else 0)
+            if non_audio > 0:
+                logger.info(
+                    "dropping non-audio inbound attachment(s); worker accepts text/audio only",
+                    extra={"user_id": message.user_id, "dropped": non_audio},
+                )
+
+        if not await engine_client.submit(message, audio=audio):
             logger.warning(
                 "inbound message not relayed to worker",
                 extra={"user_id": message.user_id, "chat_id": message.chat_id},
@@ -77,7 +105,7 @@ async def run() -> None:
     listener_task = asyncio.create_task(
         run_listener(
             settings,
-            handler=_make_inbound_handler(engine_client),
+            handler=_make_inbound_handler(engine_client, signal_client, settings),
             signal_client=signal_client,
         ),
         name="signal-listener",

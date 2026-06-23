@@ -277,6 +277,70 @@ async def test_attachment_send_gives_up_after_max_attempts() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Outbound media (voice notes + batched attachments)
+# ---------------------------------------------------------------------------
+
+
+async def test_send_voice_note_sets_voice_flag() -> None:
+    daemon = FakeDaemon()
+    client = _make_client(daemon)
+    ok = await client.send_voice_note(PEER, "/tmp/voice.m4a")
+    assert ok is True
+
+    params = daemon.calls("send")[0]["params"]
+    assert params["attachments"] == ["/tmp/voice.m4a"]
+    assert params["voiceNote"] is True
+    assert params["recipient"] == [PEER]
+
+
+async def test_send_attachments_single_batch() -> None:
+    daemon = FakeDaemon()
+    client = _make_client(daemon)
+    ok = await client.send_attachments(PEER, ["/tmp/a.pdf", "/tmp/b.pdf"], message="files")
+    assert ok is True
+
+    (call,) = daemon.calls("send")
+    params = call["params"]
+    assert params["attachments"] == ["/tmp/a.pdf", "/tmp/b.pdf"]
+    assert params["message"] == "files"
+
+
+async def test_send_attachments_empty_is_noop() -> None:
+    daemon = FakeDaemon()
+    client = _make_client(daemon)
+    assert await client.send_attachments(PEER, []) is True
+    assert daemon.calls("send") == []
+
+
+async def test_send_attachments_batches_at_32_per_rpc() -> None:
+    daemon = FakeDaemon()
+    client = _make_client(daemon)
+    paths = [f"/tmp/f{i}.pdf" for i in range(33)]
+    ok = await client.send_attachments(PEER, paths, message="caption")
+    assert ok is True
+
+    sends = daemon.calls("send")
+    assert len(sends) == 2
+    assert len(sends[0]["params"]["attachments"]) == 32
+    assert len(sends[1]["params"]["attachments"]) == 1
+    # Caption rides only the first batch.
+    assert sends[0]["params"]["message"] == "caption"
+    assert sends[1]["params"]["message"] == ""
+
+
+async def test_send_attachments_reports_batch_failure() -> None:
+    daemon = FakeDaemon()
+    # Two rate-limit errors (tiny retry_after) exhaust the retries fast.
+    daemon.script(
+        "send",
+        {"error": {"code": -5, "message": "Retry after 0.01 seconds"}},
+        {"error": {"code": -5, "message": "Retry after 0.01 seconds"}},
+    )
+    client = _make_client(daemon)
+    assert await client.send_attachments(PEER, ["/tmp/a.pdf"]) is False
+
+
+# ---------------------------------------------------------------------------
 # Reactions
 # ---------------------------------------------------------------------------
 

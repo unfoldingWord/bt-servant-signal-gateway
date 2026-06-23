@@ -32,6 +32,7 @@ import httpx
 
 from bt_signal_gateway.config import Settings
 from bt_signal_gateway.envelope import InboundMessage
+from bt_signal_gateway.media import InboundAudio
 
 logger = logging.getLogger(__name__)
 
@@ -46,23 +47,33 @@ _DEFAULT_RETRY_AFTER_S = 5.0
 _RETRY_AFTER_CAP_S = 60.0
 
 
-def build_chat_request(message: InboundMessage, settings: Settings) -> dict[str, Any]:
+def build_chat_request(
+    message: InboundMessage,
+    settings: Settings,
+    *,
+    audio: InboundAudio | None = None,
+) -> dict[str, Any]:
     """Build the worker ``ChatRequest`` body for an inbound Signal message.
 
-    Always a text request for now — inbound audio/attachment bytes are fetched in
-    a later issue. Group messages add the ``chat_type``/``chat_id``/``speaker``
-    fields the worker needs for group context.
+    When *audio* is provided the request is an ``audio`` type carrying
+    ``audio_base64`` + ``audio_format`` (any text rides along as the ``message``
+    caption); otherwise it's a plain ``text`` request. Group messages add the
+    ``chat_type``/``chat_id``/``speaker`` fields the worker needs for group
+    context.
     """
     body: dict[str, Any] = {
         "client_id": CLIENT_ID,
         "user_id": message.user_id,
-        "message_type": "text",
+        "message_type": "audio" if audio else "text",
         "message": message.text,
         "message_key": str(message.timestamp_ms),
         "progress_callback_url": settings.progress_callback_url,
         "progress_mode": "complete",
         "org": settings.engine_org,
     }
+    if audio:
+        body["audio_base64"] = audio.audio_base64
+        body["audio_format"] = audio.audio_format
     if message.is_group:
         body["chat_type"] = "group"
         body["chat_id"] = message.chat_id
@@ -122,14 +133,15 @@ class EngineClient:
             "Content-Type": "application/json",
         }
 
-    async def submit(self, message: InboundMessage) -> bool:
+    async def submit(self, message: InboundMessage, *, audio: InboundAudio | None = None) -> bool:
         """Submit *message* to the worker; return ``True`` on a ``202`` ack.
 
-        Retries on ``429`` honoring its retry hint (up to :data:`_MAX_ATTEMPTS`
-        total attempts). Any other non-2xx response, or a transport error,
-        returns ``False`` without retrying.
+        When *audio* is provided the submission is an ``audio`` request carrying
+        the encoded bytes. Retries on ``429`` honoring its retry hint (up to
+        :data:`_MAX_ATTEMPTS` total attempts). Any other non-2xx response, or a
+        transport error, returns ``False`` without retrying.
         """
-        body = build_chat_request(message, self._settings)
+        body = build_chat_request(message, self._settings, audio=audio)
         headers = self._headers()
 
         for attempt in range(1, _MAX_ATTEMPTS + 1):

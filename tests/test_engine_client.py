@@ -15,6 +15,7 @@ from bt_signal_gateway import engine_client as engine_module
 from bt_signal_gateway.config import Settings
 from bt_signal_gateway.engine_client import EngineClient, build_chat_request
 from bt_signal_gateway.envelope import InboundMessage
+from bt_signal_gateway.media import InboundAudio
 
 ACCOUNT = "+15551234567"
 API_KEY = "secret-token"
@@ -109,6 +110,42 @@ def test_build_chat_request_group_shape() -> None:
     assert body["chat_id"] == "group:dGVzdGdyb3Vw"
     assert body["speaker"] == "Alice"
     assert body["message_key"] == "1700000000001"
+
+
+def test_build_chat_request_audio_shape() -> None:
+    body = build_chat_request(
+        _dm_message(),
+        _settings(),
+        audio=InboundAudio(audio_base64="QUJD", audio_format="aac"),
+    )
+    assert body["message_type"] == "audio"
+    assert body["audio_base64"] == "QUJD"
+    assert body["audio_format"] == "aac"
+    # The text caption still rides along as the message body.
+    assert body["message"] == "hello there"
+
+
+def test_build_chat_request_text_omits_audio_fields() -> None:
+    body = build_chat_request(_dm_message(), _settings())
+    assert body["message_type"] == "text"
+    assert "audio_base64" not in body
+    assert "audio_format" not in body
+
+
+async def test_submit_with_audio_sends_audio_request() -> None:
+    worker = FakeWorker(httpx.Response(202, json={"status": "queued"}))
+    client = _client(worker)
+    try:
+        ok = await client.submit(
+            _dm_message(), audio=InboundAudio(audio_base64="QUJD", audio_format="ogg")
+        )
+        assert ok is True
+    finally:
+        await client.aclose()
+
+    assert worker.bodies[0]["message_type"] == "audio"
+    assert worker.bodies[0]["audio_base64"] == "QUJD"
+    assert worker.bodies[0]["audio_format"] == "ogg"
 
 
 def test_build_chat_request_group_omits_empty_speaker() -> None:

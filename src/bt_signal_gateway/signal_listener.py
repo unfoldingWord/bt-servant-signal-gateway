@@ -9,10 +9,12 @@ messages to an async *handler*. The handler that relays to the worker lives in
 Resilience, ported and trimmed from ``../hermes-agent/gateway/platforms/signal.py``
 (``_sse_listener`` / ``_health_monitor``):
 
-- auto-reconnect with exponential backoff (2s→60s) + jitter, reset on each
-  successful connect;
-- an idle health monitor that pings ``/api/v1/check`` when the stream has been
-  quiet and forces a reconnect if the daemon is unreachable.
+- auto-reconnect with exponential backoff (2s→5s) + jitter, reset on each
+  successful connect; the backoff sleep is interruptible so the health monitor
+  can cut it short the moment the daemon is reachable again;
+- a health monitor that, between connection attempts, probes ``/api/v1/check`` and
+  wakes the listener as soon as the daemon is back (no waiting out the backoff), and
+  while a stream is live forces a reconnect if the daemon goes quiet and unreachable.
 
 ``run_listener`` preserves a clean :class:`asyncio.CancelledError` contract so the
 app entrypoint can cancel it as part of an orderly shutdown.
@@ -40,11 +42,13 @@ logger = logging.getLogger(__name__)
 #: Coroutine called once per accepted inbound message.
 InboundHandler = Callable[[InboundMessage], Awaitable[None]]
 
+# signal-cli runs on loopback in the same container, so a long backoff cap only
+# delays recovery after a daemon bounce — keep it small.
 SSE_RETRY_DELAY_INITIAL = 2.0
-SSE_RETRY_DELAY_MAX = 60.0
+SSE_RETRY_DELAY_MAX = 5.0
 SSE_RETRY_JITTER = 0.2
-HEALTH_CHECK_INTERVAL = 30.0
-HEALTH_CHECK_STALE_THRESHOLD = 120.0
+HEALTH_CHECK_INTERVAL = 5.0
+HEALTH_CHECK_STALE_THRESHOLD = 30.0
 
 
 class _Listener:
@@ -74,6 +78,9 @@ class _Listener:
         self._last_activity = time.monotonic()
         self._response: httpx.Response | None = None
         self._backoff = SSE_RETRY_DELAY_INITIAL
+        # Set by the health monitor to cut a backoff sleep short once the daemon
+        # is reachable again, so we don't wait out the full delay after a restart.
+        self._wakeup = asyncio.Event()
 
     async def run(self) -> None:
         """Stream forever, with a sidecar health monitor, until cancelled."""
@@ -97,7 +104,11 @@ class _Listener:
                 logger.warning("signal sse: stream error", extra={"error": str(exc)})
             delay = self._backoff + self._backoff * SSE_RETRY_JITTER * random.random()
             logger.debug("signal sse: reconnecting", extra={"delay_s": round(delay, 1)})
-            await asyncio.sleep(delay)
+            # Interruptible sleep: the health monitor sets _wakeup once the daemon
+            # is reachable, so a daemon bounce doesn't cost the full backoff delay.
+            self._wakeup.clear()
+            with suppress(TimeoutError):
+                await asyncio.wait_for(self._wakeup.wait(), timeout=delay)
             self._backoff = min(self._backoff * 2, SSE_RETRY_DELAY_MAX)
 
     async def _stream_once(self) -> None:
@@ -150,25 +161,38 @@ class _Listener:
         await self._handler(message)
 
     async def _health_monitor(self) -> None:
-        """Ping the daemon when the stream goes quiet; force reconnect if down."""
+        """Drive reconnection: wake a backoff once the daemon is back; reconnect a
+        stalled live stream if the daemon goes quiet and unreachable."""
         while True:
             await asyncio.sleep(HEALTH_CHECK_INTERVAL)
+            if self._response is None:
+                # Between attempts (in backoff): if the daemon answers, retry now
+                # instead of waiting out the remaining backoff.
+                if await self._daemon_reachable():
+                    self._wakeup.set()
+                continue
             idle = time.monotonic() - self._last_activity
             if idle < HEALTH_CHECK_STALE_THRESHOLD:
                 continue
             logger.warning("signal sse: idle, pinging daemon", extra={"idle_s": round(idle)})
-            try:
-                resp = await self._client.get(self._check_url, timeout=10.0)
-            except Exception as exc:  # daemon unreachable → force a reconnect
-                logger.warning("signal: health check error", extra={"error": str(exc)})
-                await self._force_reconnect()
-                continue
-            if resp.status_code == 200:
+            if await self._daemon_reachable():
                 # Daemon alive but quiet — reset so we don't ping in a tight loop.
                 self._last_activity = time.monotonic()
             else:
-                logger.warning("signal: health check failed", extra={"status": resp.status_code})
                 await self._force_reconnect()
+
+    async def _daemon_reachable(self) -> bool:
+        """Whether the daemon's HTTP server answers at all.
+
+        Any completed response — even a non-2xx — means the server is up enough to
+        attempt the event stream; only a transport/connection error counts as down.
+        """
+        try:
+            await self._client.get(self._check_url, timeout=5.0)
+        except Exception as exc:
+            logger.warning("signal: health check error", extra={"error": str(exc)})
+            return False
+        return True
 
     async def _force_reconnect(self) -> None:
         """Break the active stream so :meth:`_consume_forever` reconnects."""

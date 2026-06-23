@@ -164,6 +164,44 @@ async def test_reconnects_after_stream_drop() -> None:
 
 
 @pytest.mark.asyncio
+async def test_recovers_after_daemon_refuses_connections() -> None:
+    """Mimics a deploy: the daemon refuses connections for a few attempts, then the
+    HTTP server comes back. The listener must reconnect and deliver — not sit out a
+    long backoff — and the health-check probe must tolerate non-2xx responses."""
+    events_attempts = 0
+    check_hits = 0
+    done = asyncio.Event()
+    received: list[InboundMessage] = []
+
+    async def handler(msg: InboundMessage) -> None:
+        received.append(msg)
+        done.set()
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        nonlocal events_attempts, check_hits
+        if request.url.path == "/api/v1/check":
+            # Server up but account not yet connected → non-2xx, still "reachable".
+            check_hits += 1
+            return httpx.Response(404)
+        events_attempts += 1
+        if events_attempts <= 3:
+            raise httpx.ConnectError("connection refused", request=request)
+        return httpx.Response(200, content=_sse_body(_dm_envelope("back online")))
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(respond))
+
+    await _run_until(
+        lambda: signal_listener.run_listener(_settings(), handler=handler, client=client),
+        received=done,
+        client=client,
+    )
+    await client.aclose()
+
+    assert events_attempts >= 4  # 3 refused + at least one success
+    assert [m.text for m in received] == ["back online"]
+
+
+@pytest.mark.asyncio
 async def test_cancellation_is_clean() -> None:
     """Cancelling the listener task propagates CancelledError, not a swallow."""
 

@@ -1,6 +1,6 @@
 [project]
 name = "bt-servant-signal-gateway"
-version = "0.6.0"
+version = "0.6.1"
 description = "Signal messenger gateway for BT Servant — relays messages between Signal (via signal-cli) and bt-servant-worker."
 readme = "README.md"
 requires-python = ">=3.11"

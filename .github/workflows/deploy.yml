@@ -1,0 +1,40 @@
+name: Deploy Production
+
+# Production is manual (workflow_dispatch). Unlike a CF Worker, this is an always-on
+# stateful Machine, so we don't auto-deploy prod on every merge. The guard step below
+# refuses to deploy a commit whose CI isn't green — giving the manual path the same "never
+# deploy red" guarantee that staging gets structurally from `workflow_run`.
+on:
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    name: Deploy to Production
+    runs-on: ubuntu-latest
+    environment: production
+    concurrency:
+      group: deploy-production
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Require CI green on this commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          sha="${{ github.sha }}"
+          conclusion=$(gh run list --workflow ci.yml --branch main --limit 50 \
+            --json headSha,status,conclusion \
+            --jq 'map(select(.headSha=="'"$sha"'" and .status=="completed")) | .[0].conclusion // "none"')
+          echo "CI conclusion for $sha: $conclusion"
+          if [ "$conclusion" != "success" ]; then
+            echo "::error::CI is not green for $sha (got '$conclusion'). Refusing to deploy."
+            exit 1
+          fi
+
+      - uses: superfly/flyctl-actions/setup-flyctl@master
+
+      - name: Deploy to production
+        run: flyctl deploy --remote-only --app bt-servant-signal-gateway
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}

@@ -1,0 +1,40 @@
+# Local-dev stack: one container running both signal-cli and the gateway (same image as
+# production), with a named volume standing in for the Fly Volume so signal-cli state
+# survives `docker compose down`/`up`.
+#
+#   cp .env.example .env   # then edit (SIGNAL_ACCOUNT, ENGINE_*, GATEWAY_PUBLIC_URL)
+#   docker compose up --build
+#   curl localhost:8081/health
+#   # one-time registration (see README "Provisioning the Signal account"):
+#   docker compose exec gateway supervisorctl stop signal-cli
+#   docker compose exec gateway signal-cli --config /data/signal-cli -a "$SIGNAL_ACCOUNT" register --voice --captcha "<token>"
+#   docker compose exec gateway signal-cli --config /data/signal-cli -a "$SIGNAL_ACCOUNT" verify <code>
+#   docker compose exec gateway supervisorctl start signal-cli
+
+services:
+  gateway:
+    build:
+      context: .
+      args:
+        SIGNAL_CLI_VERSION: ${SIGNAL_CLI_VERSION:-0.14.5}
+    env_file:
+      - .env
+    environment:
+      # Both processes share the container's loopback, so the daemon is always reachable
+      # here regardless of any host-oriented value in .env.
+      SIGNAL_HTTP_URL: http://127.0.0.1:8080
+    ports:
+      # The container always serves the callback server on 8081 (matches EXPOSE/healthcheck).
+      - "8081:8081"
+    volumes:
+      - signal_data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8081/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+volumes:
+  signal_data:

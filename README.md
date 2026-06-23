@@ -14,9 +14,11 @@ long-lived connection. See [CLAUDE.md](./CLAUDE.md) for the architecture and rat
 > (`signal_client.py` — send, reactions, contacts, attachments, voice notes), the inbound SSE
 > listener (`signal_listener.py` + `envelope.py` — parse, filter, normalize), the engine client
 > (`engine_client.py` — relays accepted messages to the worker via `POST /api/v1/chat/callback`),
-> reply dispatch (`callback_server.py` + `dispatch.py`), and media handling (`media.py` — inbound
-> audio + outbound voice/attachments) are implemented. Remaining work (containerization, Fly.io
-> deploy) is tracked in the [project epic](https://github.com/unfoldingWord/bt-servant-signal-gateway/issues/11).
+> reply dispatch (`callback_server.py` + `dispatch.py`), media handling (`media.py` — inbound
+> audio + outbound voice/attachments), and the container + Fly.io deploy pipeline (`Dockerfile`,
+> `supervisord.conf`, `docker-compose.yml`, `fly.toml`, deploy workflows) are implemented.
+> Remaining work (end-to-end smoke + group verification + docs finalization) is tracked in the
+> [project epic](https://github.com/unfoldingWord/bt-servant-signal-gateway/issues/11).
 
 ## Architecture
 
@@ -91,11 +93,123 @@ commit, the test suite runs on push. Install both hook types once:
 uv run pre-commit install   # installs pre-commit AND pre-push hooks
 ```
 
+### With Docker Compose (full stack)
+
+`docker compose` runs the **same image as production** — signal-cli and the gateway together in
+one container — with a named volume standing in for the Fly Volume, so signal-cli state survives
+`down`/`up`. Use this when you need a live signal-cli daemon, not just the Python halves.
+
+```bash
+cp .env.example .env         # then edit (SIGNAL_ACCOUNT, ENGINE_*, GATEWAY_PUBLIC_URL)
+docker compose up --build
+curl localhost:8081/health   # {"ok": true, "service": "bt-servant-signal-gateway"}
+```
+
+`SIGNAL_HTTP_URL` is forced to `http://127.0.0.1:8080` inside the container (both processes share
+loopback). On first boot signal-cli has no registered account yet and will restart until you run
+the one-time registration below (against the compose volume):
+
+```bash
+docker compose exec gateway supervisorctl stop signal-cli
+docker compose exec gateway signal-cli --config /data/signal-cli -a "$SIGNAL_ACCOUNT" register --voice --captcha "<token>"
+docker compose exec gateway signal-cli --config /data/signal-cli -a "$SIGNAL_ACCOUNT" verify <code>
+docker compose exec gateway supervisorctl start signal-cli
+```
+
+See **Provisioning the Signal account** below for where the captcha token and code come from.
+
 ## Deployment
 
-Fly.io, one always-on Machine + a persistent **Volume** for signal-cli state. _(TODO: filled in
-by the containerization and Fly deploy issues, including the one-time `signal-cli link` QR
-bootstrap.)_
+Hosted on **[Fly.io](https://fly.io)** as **one always-on Machine** with a persistent **Volume**
+mounted at `/data` for signal-cli's account + double-ratchet state. The container runs two
+processes under `supervisord` (`supervisord.conf`): the `signal-cli` JSON-RPC daemon (loopback
+`127.0.0.1:8080`, never publicly exposed) and the Python gateway (callback server on `8081`,
+which Fly publishes as `GATEWAY_PUBLIC_URL`). Config lives in `fly.toml`; the build is the repo
+`Dockerfile`.
+
+> ⚠️ **Single instance only.** A Signal account can be primary in exactly one place — never run
+> two `signal-cli` daemons against one number (it corrupts the session). Scale-to-zero is disabled
+> (`min_machines_running = 1`, `auto_stop_machines = false`) because signal-cli must stay
+> connected. On deploy/restart Fly sends `SIGTERM` and waits (`kill_timeout`) so signal-cli can
+> flush ratchet state before `SIGKILL`.
+
+All infrastructure lives under the **unfoldingWord** Fly org, never a personal account.
+
+### CI/CD
+
+| Workflow | Trigger | Target |
+|---|---|---|
+| `deploy-staging.yml` | `workflow_run` on a **green CI** run on `main` | `bt-servant-signal-gateway-staging` |
+| `deploy.yml` | manual `workflow_dispatch` (+ a guard that refuses a commit whose CI isn't green) | `bt-servant-signal-gateway` |
+
+Both authenticate via a `FLY_API_TOKEN` secret and run `flyctl deploy`. The workflows are scoped
+to GitHub **Environments** (`staging` / `production`), each holding its own **app-scoped**
+`FLY_API_TOKEN`; GitHub holds only those tokens, while every runtime value lives in Fly secrets.
+A required reviewer on the `production` environment is recommended.
+
+### One-time Fly setup (unfoldingWord org)
+
+The org slug is `unfoldingword-949` and the apps live in `iad` (must match `fly.toml`'s
+`primary_region` and the Volume region).
+
+```bash
+fly auth login                                   # authenticate (interactive)
+fly orgs list                                    # confirm the org slug (unfoldingword-949)
+
+# Apps (staging + production)
+fly apps create bt-servant-signal-gateway --org unfoldingword-949
+fly apps create bt-servant-signal-gateway-staging --org unfoldingword-949
+
+# One Volume per app, in fly.toml's primary_region
+fly volumes create signal_data --app bt-servant-signal-gateway --region iad --size 1
+fly volumes create signal_data --app bt-servant-signal-gateway-staging --region iad --size 1
+
+# App-scoped deploy token → per-environment GitHub secret
+fly tokens create deploy --app bt-servant-signal-gateway-staging | gh secret set FLY_API_TOKEN --env staging
+fly tokens create deploy --app bt-servant-signal-gateway         | gh secret set FLY_API_TOKEN --env production
+
+# Runtime secrets in Fly (NOT GitHub), per app. Staging points at the staging worker.
+fly secrets set \
+  ENGINE_API_KEY=… \
+  SIGNAL_ACCOUNT=+1XXXXXXXXXX \
+  ENGINE_BASE_URL=https://api.btservant.ai \
+  ENGINE_ORG=unfoldingWord \
+  GATEWAY_PUBLIC_URL=https://bt-servant-signal-gateway.fly.dev \
+  --app bt-servant-signal-gateway
+# staging: ENGINE_BASE_URL=https://staging-api.btservant.ai
+#          GATEWAY_PUBLIC_URL=https://bt-servant-signal-gateway-staging.fly.dev
+
+fly deploy --app bt-servant-signal-gateway       # first deploy (or let the workflow do it)
+```
+
+> **Staging's account:** because a number is single-homed, staging **cannot** share the
+> production GV number. Either leave staging's `SIGNAL_ACCOUNT` set but **unregistered** (it's a
+> deploy/health target — the daemon restart-loops harmlessly while `/health` still works), or give
+> staging its own number later.
+
+## Provisioning the Signal account
+
+The bot uses a **Google Voice number** (provisioned under an unfoldingWord Google account), and
+`signal-cli` is **registered as the primary device** on it — no physical phone or smartphone
+Signal app. This is a one-time bootstrap that writes state to the persistent Volume; the
+supervised daemon holds a lock on the config dir, so stop it first.
+
+```bash
+fly ssh console --app bt-servant-signal-gateway
+# inside the Machine:
+supervisorctl stop signal-cli
+signal-cli --config /data/signal-cli -a +1XXXXXXXXXX register --voice --captcha "<signalcaptcha://…>"
+signal-cli --config /data/signal-cli -a +1XXXXXXXXXX verify <code>
+signal-cli --config /data/signal-cli -a +1XXXXXXXXXX updateProfile --name "BT Servant"   # optional
+supervisorctl start signal-cli
+```
+
+- **Captcha token:** open <https://signalcaptchas.org/registration/generate.html>, solve it, and
+  copy the resulting `signalcaptcha://…` link.
+- **`--voice`:** Google Voice often won't receive Signal's SMS, so request the **voice call** and
+  read the code from the Google Voice inbox/transcript.
+- **State persists:** restart the Machine (`fly apps restart bt-servant-signal-gateway`) and
+  confirm signal-cli comes back up **without re-registering** — proof the Volume holds the state.
 
 ## Engine contract
 

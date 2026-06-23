@@ -164,6 +164,58 @@ async def test_reconnects_after_stream_drop() -> None:
 
 
 @pytest.mark.asyncio
+async def test_health_monitor_wakes_backoff_after_daemon_refuses(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Mimics a deploy: the daemon refuses connections, so the listener enters a *long*
+    backoff. The only thing that can rescue it quickly is the health monitor probing
+    ``/api/v1/check`` and waking the backoff — so this deterministically covers both
+    ``_daemon_reachable`` (tolerating a non-2xx ``/check``) and the ``_wakeup`` path.
+
+    Backoff is forced long and the monitor interval short: if ``_wakeup.set()`` or
+    ``_daemon_reachable()`` were broken, the listener would sit in the 30s sleep and
+    ``_run_until``'s 2s timeout would fail the test."""
+    # Override the autouse _fast_backoff fixture: make the backoff far longer than the
+    # monitor interval, so a prompt reconnect can only come from the wakeup.
+    monkeypatch.setattr(signal_listener, "SSE_RETRY_DELAY_INITIAL", 30.0)
+    monkeypatch.setattr(signal_listener, "SSE_RETRY_DELAY_MAX", 30.0)
+    monkeypatch.setattr(signal_listener, "HEALTH_CHECK_INTERVAL", 0.02)
+
+    events_attempts = 0
+    check_hits = 0
+    done = asyncio.Event()
+    received: list[InboundMessage] = []
+
+    async def handler(msg: InboundMessage) -> None:
+        received.append(msg)
+        done.set()
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        nonlocal events_attempts, check_hits
+        if request.url.path == "/api/v1/check":
+            # Server up but account not yet connected → non-2xx, still "reachable".
+            check_hits += 1
+            return httpx.Response(404)
+        events_attempts += 1
+        if events_attempts == 1:
+            raise httpx.ConnectError("connection refused", request=request)
+        return httpx.Response(200, content=_sse_body(_dm_envelope("back online")))
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(respond))
+
+    await _run_until(
+        lambda: signal_listener.run_listener(_settings(), handler=handler, client=client),
+        received=done,
+        client=client,
+    )
+    await client.aclose()
+
+    assert events_attempts >= 2  # 1 refused + the wakeup-driven success
+    assert check_hits > 0  # the health monitor actually probed /api/v1/check
+    assert [m.text for m in received] == ["back online"]
+
+
+@pytest.mark.asyncio
 async def test_cancellation_is_clean() -> None:
     """Cancelling the listener task propagates CancelledError, not a swallow."""
 

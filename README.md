@@ -10,15 +10,16 @@ service**, because Signal has no hosted webhook API: it talks to a local
 [`signal-cli`](https://github.com/AsamK/signal-cli) daemon, which needs persistent disk and a
 long-lived connection. See [CLAUDE.md](./CLAUDE.md) for the architecture and rationale.
 
-> Status: **in progress**. `/health`, the outbound signal-cli JSON-RPC client
+> Status: **shipped**. DM text, group (mention-gated), and voice-note round-trips all work
+> end-to-end against the worker. Implemented: `/health`, the outbound signal-cli JSON-RPC client
 > (`signal_client.py` — send, reactions, contacts, attachments, voice notes), the inbound SSE
-> listener (`signal_listener.py` + `envelope.py` — parse, filter, normalize), the engine client
-> (`engine_client.py` — relays accepted messages to the worker via `POST /api/v1/chat/callback`),
-> reply dispatch (`callback_server.py` + `dispatch.py`), media handling (`media.py` — inbound
-> audio + outbound voice/attachments), and the container + Fly.io deploy pipeline (`Dockerfile`,
-> `supervisord.conf`, `docker-compose.yml`, `fly.toml`, deploy workflows) are implemented.
-> Remaining work (end-to-end smoke + group verification + docs finalization) is tracked in the
-> [project epic](https://github.com/unfoldingWord/bt-servant-signal-gateway/issues/11).
+> listener (`signal_listener.py` + `envelope.py` — parse, filter, normalize, group + mention
+> gating), the engine client (`engine_client.py` — relays accepted messages to the worker via
+> `POST /api/v1/chat/callback`), reply dispatch (`callback_server.py` + `dispatch.py`), media
+> handling (`media.py` — inbound audio + outbound voice/attachments), and the container + Fly.io
+> deploy pipeline (`Dockerfile`, `supervisord.conf`, `docker-compose.yml`, `fly.toml`, deploy
+> workflows). See **[Groups](#groups)** and the **[manual smoke checklist](#manual-smoke-checklist)**
+> below for operating + verifying the gateway.
 
 ## Architecture
 
@@ -69,8 +70,56 @@ production (`fly secrets set`), never committed.
 | `PORT` |  | `8081` | Bind port for this gateway's callback server. |
 | `CHUNK_SIZE` |  | `1500` | Max characters per outbound Signal message; longer replies are split. |
 | `MESSAGE_AGE_CUTOFF_SECONDS` |  | `3600` | Drop inbound messages older than this (avoids replaying a backlog after downtime). |
-| `SIGNAL_GROUP_ALLOWED_USERS` |  | _(empty)_ | Comma-separated allowed group member ids, or `*` for all. Empty = groups disabled. |
+| `SIGNAL_GROUP_ALLOWED_USERS` |  | _(empty)_ | Comma-separated allowed **group IDs** (the `groupId` from each group's `groupInfo`), or `*` for all groups. Empty = groups disabled. ⚠️ The name says USERS, but it gates on the group ID, not member ids. See [Groups](#groups). |
 | `SIGNAL_REQUIRE_MENTION` |  | `true` | In groups, only respond when the bot is @mentioned. |
+
+## Groups
+
+The gateway supports Signal group chats, but they are **disabled by default** — you must opt in
+per group.
+
+- **Enable:** put the group's ID (or `*` for every group) in `SIGNAL_GROUP_ALLOWED_USERS`. An
+  empty value means groups are off and group messages are silently dropped.
+- **Mention gate:** with `SIGNAL_REQUIRE_MENTION=true` (the default) the bot only replies when it
+  is **@mentioned** in the group; messages that don't mention it are ignored. Set it to `false`
+  to answer every (allowed-group) message.
+- **Finding a group's ID:** the `groupId` arrives on every inbound group envelope as
+  `groupInfo.groupId` (log at `DEBUG` to see dropped/allowed decisions), or list known groups
+  with `signal-cli -a "$SIGNAL_ACCOUNT" listGroups`.
+- **Speaker + history:** for group messages the gateway sends `chat_type="group"`, the group's
+  `chat_id`, and the sender's display name as `speaker`, so the worker keeps shared per-group
+  history and knows who spoke. Replies route back to the group via its `groupId`.
+
+### Enabling a group
+
+```bash
+# allow one specific group
+fly secrets set SIGNAL_GROUP_ALLOWED_USERS='<groupId>' --app bt-servant-signal-gateway
+# …or allow all groups the bot is added to
+fly secrets set SIGNAL_GROUP_ALLOWED_USERS='*' --app bt-servant-signal-gateway
+```
+
+Then add the bot's Signal number to the group and @mention it.
+
+## Manual smoke checklist
+
+There is no automated live end-to-end test (Signal has no inbound webhook to inject against, and
+a real round-trip needs a second registered account). Use this checklist to verify a deployment
+by hand — each line is an action and the expected result:
+
+- **DM text round-trip** — DM the bot; an AI reply arrives.
+- **Group message (mention-gated)** — in an allowed group, @mention the bot → it replies; send a
+  message **without** the mention → it stays silent.
+- **Voice-note round-trip** — send a voice note; the worker transcribes it and the reply arrives
+  (delivered as a voice note when the worker returns one).
+- **Long-message chunking** — trigger a reply longer than `CHUNK_SIZE`; it arrives split across
+  multiple Signal messages, in order.
+- **`error` fallback** — when the worker posts an `error` callback, the bot sends the fixed
+  fallback message rather than going silent.
+- **Duplicate-callback dedup** — a repeated `complete` callback with the same `message_key` does
+  not double-send.
+- **Reconnect after signal-cli restart** — restart the daemon (`supervisorctl restart
+  signal-cli`); the SSE listener reconnects and a fresh DM still gets a reply.
 
 ## Local development
 

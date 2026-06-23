@@ -37,14 +37,18 @@ Signal app ⇄ signal-cli daemon (JSON-RPC /api/v1/rpc + SSE /api/v1/events) ⇄
 
 ```
 src/bt_signal_gateway/
+├── __main__.py       # module entrypoint: `python -m bt_signal_gateway`
 ├── app.py            # async entrypoint: runs the SSE listener + the uvicorn callback server
 ├── config.py         # typed settings (pydantic-settings)
-├── signal_client.py  # signal-cli JSON-RPC client (send, sendReaction, listContacts, getAttachment)
+├── logging_config.py # logging setup
+├── signal_client.py  # signal-cli JSON-RPC client (send + voice notes/attachments, sendReaction, listContacts, getAttachment)
 ├── signal_listener.py# inbound SSE listener (reconnect/backoff)
-├── envelope.py       # Signal envelope → normalized InboundMessage + filters
+├── signal_rate_limit.py # attachment-send pacing scheduler
+├── envelope.py       # Signal envelope → normalized InboundMessage + filters (group + mention gating)
 ├── engine_client.py  # POST {ENGINE_BASE_URL}/api/v1/chat/callback
 ├── callback_server.py# FastAPI: GET /health, POST /progress-callback (X-Engine-Token)
-├── dispatch.py       # complete/error callback → chunk + send to Signal
+├── dispatch.py       # complete/error callback → chunk + send to Signal (text + media)
+├── media.py          # inbound audio encode + outbound media (voice/attachment) download
 ├── chunking.py       # split long replies at CHUNK_SIZE
 └── dedup.py          # in-memory TTL dedup on message_key
 ```

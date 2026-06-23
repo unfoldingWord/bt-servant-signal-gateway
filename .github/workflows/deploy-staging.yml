@@ -1,0 +1,33 @@
+name: Deploy Staging
+
+# Auto-deploy to staging on every green CI run on main. Keying off the CI workflow's
+# success (rather than re-running checks) means this structurally cannot deploy a red
+# commit — CI is the single gate.
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+
+jobs:
+  deploy-staging:
+    name: Deploy to Staging
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+    environment: staging
+    concurrency:
+      # Never let two deploys race — a single signal-cli Machine must not be double-rolled.
+      group: deploy-staging
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Deploy exactly the commit CI validated.
+          ref: ${{ github.event.workflow_run.head_sha }}
+
+      - uses: superfly/flyctl-actions/setup-flyctl@fc53c09e1bc3be6f54706524e3b82c4f462f77be # v1.5
+
+      - name: Deploy to staging
+        run: flyctl deploy --remote-only --app bt-servant-signal-gateway-staging
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}

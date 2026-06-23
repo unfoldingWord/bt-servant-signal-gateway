@@ -1,0 +1,46 @@
+# Fly.io app for the BT Servant Signal gateway — ONE always-on Machine with a persistent
+# Volume for signal-cli state. signal-cli must stay connected, so scale-to-zero is disabled
+# and only a single Machine ever runs (two daemons against one account corrupt the session).
+#
+# Runtime config (ENGINE_API_KEY, SIGNAL_ACCOUNT, ENGINE_BASE_URL, ENGINE_ORG,
+# GATEWAY_PUBLIC_URL) lives in `fly secrets`, NOT here. The staging deploy reuses this file
+# with `--app bt-servant-signal-gateway-staging`.
+
+app = "bt-servant-signal-gateway"
+primary_region = "iad"  # change to your region; the Volume must be created in the same one.
+
+# Graceful shutdown: send SIGTERM and wait before SIGKILL so signal-cli can flush its
+# double-ratchet state (supervisord waits up to stopwaitsecs=900s, but is bounded by this —
+# Fly caps kill_timeout, so the effective window is min(stopwaitsecs, kill_timeout)).
+kill_signal = "SIGTERM"
+kill_timeout = "300s"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[mounts]
+  source = "signal_data"
+  destination = "/data"
+
+[env]
+  HOST = "0.0.0.0"
+  PORT = "8081"
+
+[http_service]
+  internal_port = 8081
+  force_https = true
+  # Always-on: signal-cli must hold its connection, so never stop or scale to zero.
+  auto_stop_machines = false
+  auto_start_machines = false
+  min_machines_running = 1
+
+  [[http_service.checks]]
+    method = "GET"
+    path = "/health"
+    interval = "30s"
+    timeout = "5s"
+    grace_period = "20s"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "1gb"  # JVM (signal-cli) + Python — 256/512mb is too tight for the JRE.

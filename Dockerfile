@@ -39,9 +39,9 @@ RUN curl -fsSL "https://github.com/AsamK/signal-cli/releases/download/v${SIGNAL_
     && ln -s "/opt/signal-cli-${SIGNAL_CLI_VERSION}/bin/signal-cli" /usr/local/bin/signal-cli \
     && signal-cli --version
 
-# uv. Dependency versions are pinned by uv.lock + `--frozen`, so the uv binary itself need
-# not be version-pinned for reproducibility.
-COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /usr/local/bin/
+# uv, pinned to a concrete version for a reproducible build tool (no mutable `latest`);
+# dependency versions are additionally locked by uv.lock + `--frozen`.
+COPY --from=ghcr.io/astral-sh/uv:0.11.23 /uv /uvx /usr/local/bin/
 
 # Non-root runtime user. /data is the persistent volume mount holding signal-cli state.
 RUN useradd --create-home --uid 10001 app \

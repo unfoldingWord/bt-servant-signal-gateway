@@ -231,10 +231,26 @@ fly secrets set \
 fly deploy --app bt-servant-signal-gateway       # first deploy (or let the workflow do it)
 ```
 
-> **Staging's account:** because a number is single-homed, staging **cannot** share the
-> production GV number. Either leave staging's `SIGNAL_ACCOUNT` set but **unregistered** (it's a
-> deploy/health target — the daemon restart-loops harmlessly while `/health` still works), or give
-> staging its own number later.
+> ⚠️ **Staging's account — do NOT leave an unregistered number running.** Because a Signal number
+> is single-homed, staging **cannot** share the production GV number. It is tempting to point
+> staging's `SIGNAL_ACCOUNT` at a placeholder (e.g. `+15555550100`) and let it ride — **don't.**
+> `signal-cli` can't open a session for an unregistered number, so it logs `User … is not
+> registered` and exits **~90s** after start. Because that's longer than supervisord's
+> `startsecs=5`, supervisord counts each run as a *successful* start, **resets the retry counter,
+> and respawns it forever** — `startretries=5` never caps it. The result is an **infinite restart
+> loop**: a fresh JVM every ~90s plus the gateway logging `signal sse: stream error` /
+> `health check error` **every ~5s**, indefinitely. `/health` stays green, so nothing alerts —
+> it just quietly burns CPU and floods `fly logs` (this is what "Signal staging is hammering
+> fly.io" looks like). **Don't run a staging Signal daemon against an unregistered number.**
+> Instead, do one of:
+>
+> - **Don't keep staging running** — `fly machine destroy` it when idle (staging is only a
+>   deploy/health target). ⚠️ note `deploy-staging.yml` **recreates it on the next green CI on
+>   `main`**, so to stop it permanently also disable that workflow or make staging gateway-only.
+> - **Run staging gateway-only** — gate the `signal-cli` supervisord program off on staging
+>   (no daemon → no loop, `/health` still works). *(durable fix — not yet implemented; see the
+>   tracking issue.)*
+> - **Give staging its own registered number** — the full fix, if staging needs a live daemon.
 
 ## Provisioning the Signal account
 

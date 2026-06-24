@@ -1,14 +1,22 @@
-"""Dispatch worker callbacks (complete/error) back to Signal.
+"""Dispatch worker callbacks (progress/complete/error) back to Signal.
 
 The worker calls back into ``/progress-callback`` with one of four payload
-types (``status`` / ``progress`` / ``complete`` / ``error``). Signal has no
-in-place message editing, so the intermediate ``status``/``progress`` events are
-ignored at the server layer; this module handles the two terminal events:
+types (``status`` / ``progress`` / ``complete`` / ``error``). ``status`` carries
+no text and is dropped at the server layer; this module handles the rest:
 
+- ``progress`` — chunk the intermediate ``text`` and send each chunk as a *new*
+  Signal message (no media, not deduped). Signal has no message editing, but the
+  sibling gateways don't edit either — they send new messages, which Signal does
+  fine. Gives the user "…working on it" updates instead of silence.
 - ``complete`` — chunk ``text`` to ``CHUNK_SIZE`` and send each chunk to the
   originating DM or group, then deliver any media: a ``voice_audio_url`` /
-  ``voice_audio_base64`` voice note and ``attachments[]`` files.
-- ``error`` — send a fixed fallback message so the user isn't left hanging.
+  ``voice_audio_base64`` voice note and ``attachments[]`` files, then a ✅ react.
+- ``error`` — send a fixed fallback message so the user isn't left hanging, plus
+  a ❌ react.
+
+A 👀 reaction is placed on the inbound message when it's received (see
+:func:`bt_signal_gateway.app._make_inbound_handler`); the ✅/❌ here replace it
+(Signal keeps one reaction per author per message).
 
 Recipient routing mirrors the inbound contract in
 :func:`~bt_signal_gateway.engine_client.build_chat_request`: a ``chat_id`` is
@@ -58,6 +66,12 @@ _DOWNLOAD_TIMEOUT_S = 60.0
 DEFAULT_FALLBACK_MESSAGE = (
     "Sorry — something went wrong while processing your message. Please try again."
 )
+
+#: Reaction placed on the inbound message when its reply completes / errors.
+#: Signal keeps one reaction per author per message, so these replace the 👀 the
+#: listener placed on receipt (see :func:`bt_signal_gateway.app`).
+_COMPLETE_REACTION = "✅"
+_ERROR_REACTION = "❌"
 
 _VALID_TYPES = frozenset({"status", "progress", "complete", "error"})
 
@@ -126,6 +140,60 @@ def _recipient(payload: CallbackPayload) -> str:
     return payload.chat_id or payload.user_id
 
 
+async def _react(
+    payload: CallbackPayload,
+    signal_client: SignalClient,
+    emoji: str,
+    log_ctx: dict[str, Any],
+) -> None:
+    """Best-effort terminal reaction on the inbound message; never fails delivery.
+
+    The inbound message's author is ``user_id`` (uuid-preferred) and its timestamp
+    is ``message_key`` (the inbound timestamp string). A non-numeric ``message_key``
+    or a reaction RPC failure is logged and swallowed — reactions are cosmetic and
+    must not affect the reply's delivered/dedup outcome.
+    """
+    try:
+        target_timestamp = int(payload.message_key)
+    except (TypeError, ValueError):
+        logger.warning("callback: non-numeric message_key; skipping reaction", extra=log_ctx)
+        return
+    try:
+        await signal_client.send_reaction(
+            _recipient(payload), emoji, payload.user_id, target_timestamp
+        )
+    except Exception as exc:  # cosmetic — never break the reply
+        logger.warning(
+            "callback: terminal reaction failed",
+            extra={**log_ctx, "emoji": emoji, "error": str(exc)},
+        )
+
+
+async def _send_text_chunks(
+    text: str | None,
+    signal_client: SignalClient,
+    settings: Settings,
+    recipient: str,
+    log_ctx: dict[str, Any],
+) -> tuple[int, int]:
+    """Chunk *text* to ``CHUNK_SIZE`` and send each chunk in order.
+
+    Returns ``(sent, expected)``; a per-chunk failure is logged but does not abort
+    the rest. Shared by the ``progress`` and ``complete`` paths.
+    """
+    chunks = chunk_message(text or "", settings.chunk_size)
+    sent = 0
+    for index, chunk in enumerate(chunks):
+        if await signal_client.send(recipient, chunk):
+            sent += 1
+        else:
+            logger.warning(
+                "callback: chunk send failed",
+                extra={**log_ctx, "chunk_index": index, "chunk_count": len(chunks)},
+            )
+    return sent, len(chunks)
+
+
 async def dispatch_callback(
     payload: CallbackPayload,
     signal_client: SignalClient,
@@ -133,13 +201,16 @@ async def dispatch_callback(
     *,
     http_client: httpx.AsyncClient | None = None,
 ) -> bool:
-    """Deliver a terminal (``complete`` / ``error``) callback to Signal.
+    """Deliver a ``progress`` / ``complete`` / ``error`` callback to Signal.
 
-    ``complete`` chunks ``text`` to ``CHUNK_SIZE`` and sends each chunk in order,
-    then delivers any media (voice note + file attachments). A reply with neither
-    text nor media sends nothing. ``error`` sends the fallback message. Other
-    types are no-ops (the server layer already filters them). Per-item send
-    failures are logged but do not abort the rest of the reply.
+    ``progress`` chunks the intermediate ``text`` and sends each chunk as a new
+    message (no media, no dedup, no reaction). ``complete`` chunks ``text``, then
+    delivers any media (voice note + file attachments), then places a ✅ reaction;
+    a reply with neither text nor media still reacts. ``error`` sends the fallback
+    message and places a ❌ reaction. ``status`` (text-less) is a no-op — the
+    server layer already filters it. Per-item send failures are logged but do not
+    abort the rest of the reply; reaction failures are cosmetic and never change
+    the return value.
 
     ``http_client`` injects an :class:`httpx.AsyncClient` for media downloads
     (tests); when omitted a short-lived client is created and closed here.
@@ -148,7 +219,8 @@ async def dispatch_callback(
     media sent, the fallback sent, or there was nothing to send) and ``False``
     when any send failed. The caller uses this to decide whether to mark the
     ``message_key`` as completed: a ``False`` leaves the key eligible for
-    re-delivery so a repeated callback can finish the reply.
+    re-delivery so a repeated callback can finish the reply. ``progress`` returns
+    are advisory (the server fire-and-forgets them; they're never deduped).
     """
     recipient = _recipient(payload)
     log_ctx = {
@@ -160,33 +232,38 @@ async def dispatch_callback(
 
     if payload.type == "error":
         logger.error("callback: worker reported error", extra={**log_ctx, "error": payload.error})
-        return await signal_client.send(recipient, DEFAULT_FALLBACK_MESSAGE)
+        sent_ok = await signal_client.send(recipient, DEFAULT_FALLBACK_MESSAGE)
+        await _react(payload, signal_client, _ERROR_REACTION, log_ctx)
+        return sent_ok
+
+    if payload.type == "progress":
+        sent, expected = await _send_text_chunks(
+            payload.text, signal_client, settings, recipient, log_ctx
+        )
+        if expected == 0:
+            logger.debug("callback: progress with empty text, nothing to send", extra=log_ctx)
+            return True
+        logger.info("callback: progress dispatched", extra={**log_ctx, "sent": sent})
+        return sent == expected
 
     if payload.type != "complete":
         logger.debug("callback: ignoring non-terminal type", extra=log_ctx)
         return True
 
     has_media = bool(payload.voice_audio_url or payload.voice_audio_base64 or payload.attachments)
-    chunks = chunk_message(payload.text or "", settings.chunk_size)
-    if not chunks and not has_media:
+    sent, expected = await _send_text_chunks(
+        payload.text, signal_client, settings, recipient, log_ctx
+    )
+    if expected == 0 and not has_media:
         logger.info("callback: complete with empty text, nothing to send", extra=log_ctx)
+        await _react(payload, signal_client, _COMPLETE_REACTION, log_ctx)
         return True
 
     logger.info(
         "callback: dispatching complete",
-        extra={**log_ctx, "chunks": len(chunks), "has_media": has_media},
+        extra={**log_ctx, "chunks": expected, "has_media": has_media},
     )
-
-    sent = 0
-    for index, chunk in enumerate(chunks):
-        if await signal_client.send(recipient, chunk):
-            sent += 1
-        else:
-            logger.warning(
-                "callback: chunk send failed",
-                extra={**log_ctx, "chunk_index": index, "chunk_count": len(chunks)},
-            )
-    text_ok = sent == len(chunks)
+    text_ok = sent == expected
 
     media_ok = True
     if has_media:
@@ -194,13 +271,15 @@ async def dispatch_callback(
             payload, signal_client, settings, recipient, log_ctx, http_client
         )
 
+    await _react(payload, signal_client, _COMPLETE_REACTION, log_ctx)
+
     fully_delivered = text_ok and media_ok
     logger.info(
         "callback: complete dispatched",
         extra={
             **log_ctx,
             "sent": sent,
-            "expected": len(chunks),
+            "expected": expected,
             "media_ok": media_ok,
             "delivered": fully_delivered,
         },

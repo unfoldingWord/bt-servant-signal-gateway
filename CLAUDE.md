@@ -47,7 +47,7 @@ src/bt_signal_gateway/
 ├── envelope.py       # Signal envelope → normalized InboundMessage + filters (group + mention gating)
 ├── engine_client.py  # POST {ENGINE_BASE_URL}/api/v1/chat/callback
 ├── callback_server.py# FastAPI: GET /health, POST /progress-callback (X-Engine-Token)
-├── dispatch.py       # complete/error callback → chunk + send to Signal (text + media)
+├── dispatch.py       # progress/complete/error callback → chunk + send to Signal (text + media) + ✅/❌ react
 ├── media.py          # inbound audio encode + outbound media (voice/attachment) download
 ├── chunking.py       # split long replies at CHUNK_SIZE
 └── dedup.py          # in-memory TTL dedup on message_key
@@ -59,10 +59,14 @@ Much of `signal_client.py` / `signal_listener.py` / `envelope.py` is ported from
 ## Engine contract (worker integration)
 
 - Inbound → worker: `POST /api/v1/chat/callback`, `Authorization: Bearer ENGINE_API_KEY`,
-  `client_id="signal-gateway"`, `progress_mode="complete"` (Signal has no message editing →
-  one final reply). Group messages set `chat_type="group"`, `chat_id`, `speaker`.
+  `client_id="signal-gateway"`, `progress_mode="iteration"` (+ `progress_throttle_seconds=3`) so the
+  worker streams intermediate `progress` updates we relay as new messages (Signal has no editing, but
+  the sibling gateways don't edit either). Group messages set `chat_type="group"`, `chat_id`,
+  `speaker`.
 - Worker → gateway: callbacks to `{GATEWAY_PUBLIC_URL}/progress-callback` guarded by the
-  `X-Engine-Token` header. Dedup on `message_key` (the worker does not retry idempotently).
+  `X-Engine-Token` header. `progress` is fire-and-forget; only the terminal `complete` is deduped on
+  `message_key` (the worker does not retry idempotently). A 👀 reaction acks inbound receipt and is
+  replaced by ✅/❌ on the terminal callback.
 - The worker is channel-neutral; **no worker changes are needed** for Signal.
 
 ## Coding Standards

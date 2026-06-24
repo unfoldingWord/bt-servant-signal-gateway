@@ -51,11 +51,21 @@ class _FakeEngine:
 
 
 class _FakeSignal:
-    def __init__(self, data: bytes | None = b"voice") -> None:
+    def __init__(self, data: bytes | None = b"voice", *, reaction_raises: bool = False) -> None:
         self._data = data
+        self._reaction_raises = reaction_raises
+        self.reactions: list[tuple[str, str, str, int]] = []
 
     async def get_attachment(self, _attachment_id: str) -> bytes | None:
         return self._data
+
+    async def send_reaction(
+        self, chat_id: str, emoji: str, target_author: str, target_timestamp: int
+    ) -> bool:
+        if self._reaction_raises:
+            raise RuntimeError("reaction rpc boom")
+        self.reactions.append((chat_id, emoji, target_author, target_timestamp))
+        return True
 
 
 def _message(attachments: list[AttachmentRef]) -> InboundMessage:
@@ -88,6 +98,32 @@ async def test_inbound_handler_ignores_non_audio_attachment() -> None:
     await handler(_message([AttachmentRef(id="img", content_type="image/png")]))
 
     # Submitted as a plain text message — no audio fetched.
+    assert engine.calls == [None]
+
+
+async def test_inbound_handler_reacts_eyes_then_relays() -> None:
+    # issue #28: a 👀 reaction acks receipt before relaying to the worker.
+    engine = _FakeEngine()
+    signal = _FakeSignal()
+    handler = app_module._make_inbound_handler(
+        cast(EngineClient, engine), cast(SignalClient, signal), _settings()
+    )
+    msg = _message([])
+    await handler(msg)
+
+    assert signal.reactions == [(msg.chat_id, "👀", msg.user_id, msg.timestamp_ms)]
+    assert engine.calls == [None]  # still relayed
+
+
+async def test_inbound_handler_relays_even_if_reaction_fails() -> None:
+    engine = _FakeEngine()
+    signal = _FakeSignal(reaction_raises=True)
+    handler = app_module._make_inbound_handler(
+        cast(EngineClient, engine), cast(SignalClient, signal), _settings()
+    )
+    await handler(_message([]))
+
+    # Reaction RPC raised, but the message is still relayed to the worker.
     assert engine.calls == [None]
 
 

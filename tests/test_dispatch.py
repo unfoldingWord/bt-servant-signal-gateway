@@ -43,13 +43,16 @@ class _FakeSignalClient:
         *,
         voice_ok: bool = True,
         attachments_ok: bool = True,
+        reaction_raises: bool = False,
     ) -> None:
         self.sends: list[tuple[str, str]] = []
         self.voice_notes: list[tuple[str, str]] = []
         self.attachment_sends: list[tuple[str, list[str]]] = []
+        self.reactions: list[tuple[str, str, str, int]] = []
         self._results = list(results) if results is not None else None
         self._voice_ok = voice_ok
         self._attachments_ok = attachments_ok
+        self._reaction_raises = reaction_raises
 
     async def send(
         self,
@@ -73,14 +76,28 @@ class _FakeSignalClient:
         self.attachment_sends.append((chat_id, list(file_paths)))
         return self._attachments_ok
 
+    async def send_reaction(
+        self, chat_id: str, emoji: str, target_author: str, target_timestamp: int
+    ) -> bool:
+        if self._reaction_raises:
+            raise RuntimeError("reaction rpc boom")
+        self.reactions.append((chat_id, emoji, target_author, target_timestamp))
+        return True
+
 
 def _client(
     results: list[bool] | None = None,
     *,
     voice_ok: bool = True,
     attachments_ok: bool = True,
+    reaction_raises: bool = False,
 ) -> tuple[_FakeSignalClient, SignalClient]:
-    fake = _FakeSignalClient(results, voice_ok=voice_ok, attachments_ok=attachments_ok)
+    fake = _FakeSignalClient(
+        results,
+        voice_ok=voice_ok,
+        attachments_ok=attachments_ok,
+        reaction_raises=reaction_raises,
+    )
     return fake, cast(SignalClient, fake)
 
 
@@ -186,6 +203,108 @@ async def test_error_sends_fallback_message() -> None:
     payload = CallbackPayload(type="error", user_id=USER_ID, message_key="k1", error="boom")
     await dispatch_callback(payload, client, _settings())
     assert fake.sends == [(USER_ID, DEFAULT_FALLBACK_MESSAGE)]
+
+
+# --- dispatch_callback: progress streaming (issue #28) ---
+
+
+async def test_progress_streams_text_as_new_message() -> None:
+    fake, client = _client()
+    payload = CallbackPayload(
+        type="progress", user_id=USER_ID, message_key="1700000000000", text="working on it…"
+    )
+    await dispatch_callback(payload, client, _settings())
+    assert fake.sends == [(USER_ID, "working on it…")]
+    # progress is intermediate: no media, no terminal reaction.
+    assert fake.voice_notes == []
+    assert fake.reactions == []
+
+
+async def test_progress_to_group_routes_to_chat_id() -> None:
+    fake, client = _client()
+    payload = CallbackPayload(
+        type="progress",
+        user_id=USER_ID,
+        message_key="1700000000000",
+        text="thinking",
+        chat_id=GROUP_CHAT_ID,
+    )
+    await dispatch_callback(payload, client, _settings())
+    assert fake.sends == [(GROUP_CHAT_ID, "thinking")]
+
+
+async def test_progress_with_blank_text_sends_nothing() -> None:
+    fake, client = _client()
+    payload = CallbackPayload(
+        type="progress", user_id=USER_ID, message_key="1700000000000", text="   "
+    )
+    await dispatch_callback(payload, client, _settings())
+    assert fake.sends == []
+    assert fake.reactions == []
+
+
+# --- dispatch_callback: terminal reactions (issue #28) ---
+
+
+async def test_complete_reacts_with_check() -> None:
+    fake, client = _client()
+    payload = CallbackPayload(
+        type="complete", user_id=USER_ID, message_key="1700000000000", text="done"
+    )
+    await dispatch_callback(payload, client, _settings())
+    assert fake.reactions == [(USER_ID, "✅", USER_ID, 1700000000000)]
+
+
+async def test_complete_with_blank_text_still_reacts() -> None:
+    fake, client = _client()
+    payload = CallbackPayload(
+        type="complete", user_id=USER_ID, message_key="1700000000000", text="   "
+    )
+    await dispatch_callback(payload, client, _settings())
+    assert fake.sends == []
+    assert fake.reactions == [(USER_ID, "✅", USER_ID, 1700000000000)]
+
+
+async def test_error_reacts_with_cross_and_sends_fallback() -> None:
+    fake, client = _client()
+    payload = CallbackPayload(
+        type="error", user_id=USER_ID, message_key="1700000000000", error="boom"
+    )
+    await dispatch_callback(payload, client, _settings())
+    assert fake.sends == [(USER_ID, DEFAULT_FALLBACK_MESSAGE)]
+    assert fake.reactions == [(USER_ID, "❌", USER_ID, 1700000000000)]
+
+
+async def test_group_complete_reaction_targets_author_not_group() -> None:
+    fake, client = _client()
+    payload = CallbackPayload(
+        type="complete",
+        user_id=USER_ID,
+        message_key="1700000000000",
+        text="hi",
+        chat_id=GROUP_CHAT_ID,
+    )
+    await dispatch_callback(payload, client, _settings())
+    # Reaction routes to the group but targets the original author + timestamp.
+    assert fake.reactions == [(GROUP_CHAT_ID, "✅", USER_ID, 1700000000000)]
+
+
+async def test_non_numeric_message_key_skips_reaction() -> None:
+    fake, client = _client()
+    payload = CallbackPayload(type="complete", user_id=USER_ID, message_key="k1", text="hi")
+    await dispatch_callback(payload, client, _settings())
+    assert fake.sends == [(USER_ID, "hi")]
+    assert fake.reactions == []  # int("k1") fails -> reaction skipped, reply unaffected
+
+
+async def test_reaction_failure_does_not_change_delivery_result() -> None:
+    _fake, client = _client(reaction_raises=True)
+    payload = CallbackPayload(
+        type="complete", user_id=USER_ID, message_key="1700000000000", text="hi"
+    )
+    # send_reaction raises, but the reply still counts as delivered.
+    ok = await dispatch_callback(payload, client, _settings())
+    assert ok is True
 
 
 async def test_chunk_send_failure_does_not_abort_remaining_chunks() -> None:

@@ -32,7 +32,7 @@ jobs:
       group: deploy-staging
       cancel-in-progress: false
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           # Deploy exactly the commit CI validated (auto-deploy); for a manual
           # workflow_dispatch there's no workflow_run, so use the dispatched ref.

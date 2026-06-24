@@ -113,8 +113,9 @@ def create_app(
             logger.warning("callback: rejected (unrecognized payload)", extra={"body_keys": keys})
             return Response(status_code=400)
 
-        # status/progress carry no terminal reply for Signal — ack and drop.
-        if payload.type not in ("complete", "error"):
+        # status carries no text — ack and drop. (progress carries intermediate
+        # text we relay as a new message; complete/error are terminal.)
+        if payload.type == "status":
             return Response(status_code=200)
 
         signal_client: SignalClient | None = app.state.signal_client
@@ -125,8 +126,10 @@ def create_app(
             )
             return Response(status_code=503)
 
-        # error: fire-and-forget the fallback message (not deduped).
-        if payload.type == "error":
+        # progress/error: fire-and-forget, not deduped. progress streams an
+        # intermediate update as a new message; error sends the fallback. Only
+        # the terminal `complete` is deduped (below).
+        if payload.type in ("progress", "error"):
             background.add_task(dispatch_callback, payload, signal_client, settings)
             return Response(status_code=200)
 

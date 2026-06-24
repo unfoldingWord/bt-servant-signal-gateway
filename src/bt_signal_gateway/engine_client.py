@@ -7,8 +7,13 @@ worker over the shared gateway contract:
 later calls back into ``{GATEWAY_PUBLIC_URL}/progress-callback`` with the reply
 (that delivery path lives in a separate issue).
 
-``progress_mode`` is fixed to ``"complete"``: Signal has no message editing, so
-the worker should emit a single final reply rather than incremental progress.
+``progress_mode`` is ``"iteration"`` (matching the Telegram/WhatsApp gateways):
+the worker POSTs intermediate ``progress`` callbacks we relay as *new* Signal
+messages, so the user sees "…working on it" updates instead of silence until the
+final reply. Signal has no message editing, but it doesn't need any — the
+siblings don't edit either; they send new messages. ``progress_throttle_seconds``
+caps the chattiness (every progress event is a new message the user can't see
+collapse).
 
 Per the worker's ``ChatRequest`` contract
 (``../bt-servant-worker/src/types/engine.ts`` /
@@ -68,7 +73,8 @@ def build_chat_request(
         "message": message.text,
         "message_key": str(message.timestamp_ms),
         "progress_callback_url": settings.progress_callback_url,
-        "progress_mode": "complete",
+        "progress_mode": "iteration",
+        "progress_throttle_seconds": 3,
         "org": settings.engine_org,
     }
     if audio:

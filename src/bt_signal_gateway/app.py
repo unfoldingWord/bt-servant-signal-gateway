@@ -37,9 +37,23 @@ def _make_inbound_handler(
     ``audio`` request; other attachment types can't be relayed to the worker yet
     (its inbound contract is text/audio only), so they're dropped with a log and
     any caption text still goes through as a text message.
+
+    On receipt the message gets a best-effort 👀 reaction so the user sees instant
+    confirmation; the terminal callback later replaces it with ✅/❌. A reaction
+    failure is logged and never blocks the relay.
     """
 
     async def _relay(message: InboundMessage) -> None:
+        try:
+            await signal_client.send_reaction(
+                message.chat_id, "👀", message.user_id, message.timestamp_ms
+            )
+        except Exception as exc:  # acknowledgment is cosmetic — never block relay
+            logger.warning(
+                "inbound 👀 reaction failed",
+                extra={"user_id": message.user_id, "chat_id": message.chat_id, "error": str(exc)},
+            )
+
         audio = None
         if message.attachments:
             ref = select_inbound_audio(message.attachments)

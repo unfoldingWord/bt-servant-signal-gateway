@@ -32,6 +32,7 @@ class _FakeSignalClient:
 
     def __init__(self, results: list[bool] | None = None) -> None:
         self.sends: list[tuple[str, str]] = []
+        self.reactions: list[tuple[str, str, str, int]] = []
         self._results = list(results) if results is not None else None
 
     async def send(
@@ -45,6 +46,12 @@ class _FakeSignalClient:
         if self._results is None:
             return True
         return self._results.pop(0) if self._results else True
+
+    async def send_reaction(
+        self, chat_id: str, emoji: str, target_author: str, target_timestamp: int
+    ) -> bool:
+        self.reactions.append((chat_id, emoji, target_author, target_timestamp))
+        return True
 
 
 def _client(results: list[bool] | None = None) -> tuple[_FakeSignalClient, TestClient]:
@@ -126,13 +133,30 @@ def test_error_sends_fallback() -> None:
     assert fake.sends[0][0] == USER_ID
 
 
-def test_status_and_progress_are_acked_without_sending() -> None:
+def test_status_is_acked_without_sending() -> None:
     fake, client = _client()
-    for type_ in ("status", "progress"):
-        body = {"type": type_, "user_id": USER_ID, "message_key": "k1", "text": "..."}
-        resp = _post(client, body)
-        assert resp.status_code == 200
+    body = {"type": "status", "user_id": USER_ID, "message_key": "k1", "text": "..."}
+    resp = _post(client, body)
+    assert resp.status_code == 200
     assert fake.sends == []
+
+
+def test_progress_streams_text_as_new_message() -> None:
+    # issue #28: progress is relayed as a new Signal message (not dropped).
+    fake, client = _client()
+    body = {"type": "progress", "user_id": USER_ID, "message_key": "k1", "text": "working…"}
+    resp = _post(client, body)
+    assert resp.status_code == 200
+    assert fake.sends == [(USER_ID, "working…")]
+
+
+def test_duplicate_progress_is_not_deduped() -> None:
+    # Only terminal `complete` is deduped; progress fires every time.
+    fake, client = _client()
+    body = {"type": "progress", "user_id": USER_ID, "message_key": "samekey", "text": "step"}
+    assert _post(client, body).status_code == 200
+    assert _post(client, body).status_code == 200
+    assert fake.sends == [(USER_ID, "step"), (USER_ID, "step")]
 
 
 def test_unrecognized_payload_is_bad_request() -> None:

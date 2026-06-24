@@ -28,9 +28,11 @@ Signal app  ⇄  signal-cli daemon (JSON-RPC + SSE)  ⇄  this gateway  ⇄  bt-
 ```
 
 - **Inbound:** subscribe to signal-cli's SSE event stream → normalize → `POST /api/v1/chat/callback`
-  on the worker (`client_id="signal-gateway"`, `progress_mode="complete"`).
+  on the worker (`client_id="signal-gateway"`, `progress_mode="iteration"`); a best-effort 👀
+  reaction acknowledges receipt.
 - **Outbound:** the worker calls back `{GATEWAY_PUBLIC_URL}/progress-callback` → chunk + send via
-  signal-cli JSON-RPC.
+  signal-cli JSON-RPC. Intermediate `progress` updates stream as new messages; on `complete`/`error`
+  the 👀 is replaced with ✅/❌.
 
 ```
 src/bt_signal_gateway/
@@ -292,7 +294,7 @@ This gateway implements the standard, channel-neutral BT Servant gateway contrac
 | `message` / `audio_base64` + `audio_format` | text body, or base64 audio for voice notes |
 | `message_key` | the Signal message timestamp (used for dedup) |
 | `progress_callback_url` | `{GATEWAY_PUBLIC_URL}/progress-callback` |
-| `progress_mode` | `"complete"` — Signal has no message editing, so we want one final reply, not streamed edits |
+| `progress_mode` | `"iteration"` (+ `progress_throttle_seconds: 3`) — the worker streams intermediate updates we relay as new messages, matching the Telegram/WhatsApp gateways |
 | `org` | `ENGINE_ORG` |
 | `chat_type` / `chat_id` / `speaker` | set for group messages (`chat_type="group"`) |
 
@@ -302,11 +304,17 @@ The worker returns `202 Accepted` immediately.
 `{GATEWAY_PUBLIC_URL}/progress-callback`, guarded by the `X-Engine-Token` header (which must
 equal `ENGINE_API_KEY`; a missing/wrong token gets `401`). Payloads are typed `status` /
 `progress` / `complete` / `error`. The gateway acks quickly and delivers off the ack path, so a
-slow signal-cli send never blocks the worker's webhook. `status`/`progress` are ignored (Signal
-has no in-place message editing); on `complete` it splits `text` at `CHUNK_SIZE` and sends each
-chunk via the `signal-cli` JSON-RPC `send` method; on `error` it sends a fixed fallback message.
-Replies route to the originating group (`chat_id`) or DM (`user_id`). Because the worker does not
-retry idempotently, the gateway **dedups `complete` on `message_key`**.
+slow signal-cli send never blocks the worker's webhook. `status` (text-less) is acked and dropped;
+`progress` splits its intermediate `text` at `CHUNK_SIZE` and sends each chunk as a **new** message
+(Signal has no in-place editing, but the sibling gateways don't edit either — they send new messages
+too); on `complete` it splits `text` at `CHUNK_SIZE` and sends each chunk via the `signal-cli`
+JSON-RPC `send` method; on `error` it sends a fixed fallback message. Replies route to the
+originating group (`chat_id`) or DM (`user_id`). Because the worker does not retry idempotently, the
+gateway **dedups `complete` on `message_key`** — `progress` is fire-and-forget and never deduped.
+
+A 👀 reaction is placed on the inbound message when it's received; the terminal callback replaces it
+with ✅ (`complete`) or ❌ (`error`) — Signal keeps one reaction per author per message. Reactions
+are best-effort: a failure is logged and never blocks the relay or the reply.
 
 Media on `complete` is delivered after the text: a `voice_audio_url` (with `voice_audio_base64`
 fallback) is sent as a playable Signal **voice note**, and `attachments[]` (pdf/audio) are sent as

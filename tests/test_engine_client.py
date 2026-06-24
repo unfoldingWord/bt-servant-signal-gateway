@@ -95,13 +95,22 @@ def test_build_chat_request_dm_shape() -> None:
         "message": "hello there",
         "message_key": "1700000000000",
         "progress_callback_url": "https://gw.fly.dev/progress-callback",
-        "progress_mode": "complete",
+        "progress_mode": "iteration",
+        "progress_throttle_seconds": 3,
         "org": "unfoldingWord",
     }
     # DMs carry no group-context fields.
     assert "chat_type" not in body
     assert "chat_id" not in body
     assert "speaker" not in body
+
+
+def test_build_chat_request_uses_iteration_mode_with_throttle() -> None:
+    # Signal streams intermediate progress as new messages (issue #28), matching
+    # the Telegram/WhatsApp gateways: iteration mode + a 3s throttle.
+    body = build_chat_request(_dm_message(), _settings())
+    assert body["progress_mode"] == "iteration"
+    assert body["progress_throttle_seconds"] == 3
 
 
 def test_build_chat_request_group_shape() -> None:

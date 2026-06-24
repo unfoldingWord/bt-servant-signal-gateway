@@ -1,18 +1,30 @@
 name: Deploy Staging
 
-# Auto-deploy to staging on every green CI run on main. Keying off the CI workflow's
-# success (rather than re-running checks) means this structurally cannot deploy a red
-# commit — CI is the single gate.
+# ⚠️ AUTO-DEPLOY DISABLED (2026-06-23). Staging has no registered Signal number, so a
+# deployed signal-cli can't open a session and restart-loops forever (~90s JVM respawn +
+# the gateway logging connection errors every ~5s), quietly burning CPU and flooding
+# `fly logs` while `/health` stays green. See README "Staging's account" for the full
+# failure mode. The staging Machine was destroyed to stop the loop; re-deploying would
+# just recreate it.
+#
+# Until staging gets its own registered number, this workflow is MANUAL-ONLY
+# (`workflow_dispatch`) — it no longer auto-fires on every green CI run on main. To
+# re-enable auto-deploy, restore the `workflow_run` trigger below and the
+# `if: ...conclusion == 'success'` guard on the job.
+#
+# on:
+#   workflow_run:
+#     workflows: [CI]
+#     types: [completed]
+#     branches: [main]
 on:
-  workflow_run:
-    workflows: [CI]
-    types: [completed]
-    branches: [main]
+  workflow_dispatch:
 
 jobs:
   deploy-staging:
     name: Deploy to Staging
-    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    # Re-add when restoring auto-deploy:
+    # if: ${{ github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-latest
     environment: staging
     concurrency:
@@ -22,8 +34,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          # Deploy exactly the commit CI validated.
-          ref: ${{ github.event.workflow_run.head_sha }}
+          # Deploy exactly the commit CI validated (auto-deploy); for a manual
+          # workflow_dispatch there's no workflow_run, so use the dispatched ref.
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
 
       - uses: superfly/flyctl-actions/setup-flyctl@fc53c09e1bc3be6f54706524e3b82c4f462f77be # v1.5
 

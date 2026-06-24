@@ -139,7 +139,7 @@ All infrastructure lives under the **unfoldingWord** Fly org, never a personal a
 
 | Workflow | Trigger | Target |
 |---|---|---|
-| `deploy-staging.yml` | `workflow_run` on a **green CI** run on `main` | `bt-servant-signal-gateway-staging` |
+| `deploy-staging.yml` | **manual `workflow_dispatch` only** (auto-deploy on green CI disabled until staging has a registered Signal number — see [Staging's account](#one-time-fly-setup-unfoldingword-org)) | `bt-servant-signal-gateway-staging` |
 | `deploy.yml` | manual `workflow_dispatch` (+ a guard that refuses a commit whose CI isn't green) | `bt-servant-signal-gateway` |
 
 Both authenticate via a `FLY_API_TOKEN` secret and run `flyctl deploy`. The workflows are scoped

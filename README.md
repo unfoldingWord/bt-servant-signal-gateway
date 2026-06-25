@@ -278,6 +278,21 @@ supervisorctl start signal-cli
 - **State persists:** restart the Machine (`fly apps restart bt-servant-signal-gateway`) and
   confirm signal-cli comes back up **without re-registering** — proof the Volume holds the state.
 
+### Trust model (`--trust-new-identities=always`)
+
+The daemon runs with `--trust-new-identities=always` (see `supervisord.conf`). signal-cli's
+default mode, `on-first-use`, trusts a contact's identity key the first time it sees it but then
+**refuses to send** if that key ever changes — and a key changes every time a user reinstalls
+Signal, switches phones, or resets app data. In that default, the bot silently stops replying to
+that user until an operator manually runs `signal-cli … trust …`, which is untenable for a public
+bot. `always` auto-trusts new **and changed** keys, so conversations survive reinstalls with no
+intervention.
+
+This is the standard configuration for an automated/bot account. The tradeoff is that signal-cli
+no longer warns on a mid-conversation key change (the safety-number "this could be a MITM"
+check) — a protection that requires out-of-band safety-number verification we can't do with
+strangers anyway. It does **not** weaken Signal's end-to-end message encryption.
+
 ## Engine contract
 
 This gateway implements the standard, channel-neutral BT Servant gateway contract against

@@ -269,6 +269,7 @@ signal-cli --config /data/signal-cli -a +1XXXXXXXXXX register --voice --captcha 
 signal-cli --config /data/signal-cli -a +1XXXXXXXXXX verify <code>
 signal-cli --config /data/signal-cli -a +1XXXXXXXXXX updateProfile --name "BT Servant"
 signal-cli --config /data/signal-cli -a +1XXXXXXXXXX updateAccount --username btservant   # returns the username (e.g. btservant.45) + signal.me link
+signal-cli --config /data/signal-cli -a +1XXXXXXXXXX updateAccount --discoverable-by-number false   # hide from phone-number lookup → forces the username-link path
 supervisorctl start signal-cli
 ```
 
@@ -282,6 +283,14 @@ supervisorctl start signal-cli
   bot](#contacting-the-bot-username-link)**). Pass a bare nickname; Signal appends a `.NN`
   discriminator and the link encodes it. You can also set/change the username on the **running**
   daemon via the JSON-RPC `updateAccount` method instead of stopping it.
+- **Disable phone-number discoverability (`--discoverable-by-number false`):** removes the account
+  from Signal's number lookup (CDSI), so a user who *types the bot's phone number* can no longer
+  start a chat keyed to it — they're funneled to the username link instead. This closes off the
+  first-contact PNI/ACI **duplicate-thread** flow (see **[Contacting the
+  bot](#contacting-the-bot-username-link)** and [#37](https://github.com/unfoldingWord/bt-servant-signal-gateway/issues/37));
+  typing the number keys the chat to the PNI while the bot replies from its ACI. Like `--username`,
+  this can be applied on the **running** daemon. The setting is stored in signal-cli's account state
+  on the Volume, so it persists across restarts/redeploys.
 - **State persists:** restart the Machine (`fly apps restart bt-servant-signal-gateway`) and
   confirm signal-cli comes back up **without re-registering** — proof the Volume holds the state.
 
@@ -309,6 +318,11 @@ bot replies from its ACI — Signal doesn't reliably merge the two, so the user 
 **duplicate conversation** (one "unknown"/number thread, one "BT Servant" thread). Starting from
 the **username link** resolves straight to the ACI, so the chat opens as a single clean
 **BT Servant** conversation. (This was the [first-contact quirk](https://github.com/unfoldingWord/bt-servant-signal-gateway/issues/37).)
+
+The account also has **phone-number discoverability disabled** (`updateAccount
+--discoverable-by-number false`, set during [provisioning](#provisioning-the-signal-account)), so
+*typing the number* no longer resolves to the bot at all — the username link is the only way in,
+which removes the duplicate-thread trap rather than just steering users away from it.
 
 - **Username:** `btservant.45`
 - **Link + QR:** [`qr_codes/`](./qr_codes) — PNG + SVG + the regen command. Hand these out for

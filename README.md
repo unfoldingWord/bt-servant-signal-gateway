@@ -267,7 +267,8 @@ fly ssh console --app bt-servant-signal-gateway
 supervisorctl stop signal-cli
 signal-cli --config /data/signal-cli -a +1XXXXXXXXXX register --voice --captcha "<signalcaptcha://…>"
 signal-cli --config /data/signal-cli -a +1XXXXXXXXXX verify <code>
-signal-cli --config /data/signal-cli -a +1XXXXXXXXXX updateProfile --name "BT Servant"   # optional
+signal-cli --config /data/signal-cli -a +1XXXXXXXXXX updateProfile --name "BT Servant"
+signal-cli --config /data/signal-cli -a +1XXXXXXXXXX updateAccount --username btservant   # returns the username (e.g. btservant.45) + signal.me link
 supervisorctl start signal-cli
 ```
 
@@ -275,6 +276,12 @@ supervisorctl start signal-cli
   copy the resulting `signalcaptcha://…` link.
 - **`--voice`:** Google Voice often won't receive Signal's SMS, so request the **voice call** and
   read the code from the Google Voice inbox/transcript.
+- **Profile name + username (both matter for first contact):** `updateProfile --name` sets the
+  display name users see ("BT Servant"); `updateAccount --username` registers a username and returns
+  a `signal.me` link — the recommended way for users to start a chat (see **[Contacting the
+  bot](#contacting-the-bot-username-link)**). Pass a bare nickname; Signal appends a `.NN`
+  discriminator and the link encodes it. You can also set/change the username on the **running**
+  daemon via the JSON-RPC `updateAccount` method instead of stopping it.
 - **State persists:** restart the Machine (`fly apps restart bt-servant-signal-gateway`) and
   confirm signal-cli comes back up **without re-registering** — proof the Volume holds the state.
 
@@ -292,6 +299,27 @@ This is the standard configuration for an automated/bot account. The tradeoff is
 no longer warns on a mid-conversation key change (the safety-number "this could be a MITM"
 check) — a protection that requires out-of-band safety-number verification we can't do with
 strangers anyway. It does **not** weaken Signal's end-to-end message encryption.
+
+### Contacting the bot (username link)
+
+**Share the username link, not the phone number.** A Signal account has two identities: a
+permanent **ACI** (account identity, carries the "BT Servant" profile name) and a **PNI**
+(phone-number identity). Starting a chat by *typing the number* keys it to the PNI, while the
+bot replies from its ACI — Signal doesn't reliably merge the two, so the user sees a confusing
+**duplicate conversation** (one "unknown"/number thread, one "BT Servant" thread). Starting from
+the **username link** resolves straight to the ACI, so the chat opens as a single clean
+**BT Servant** conversation. (This was the [first-contact quirk](https://github.com/unfoldingWord/bt-servant-signal-gateway/issues/37).)
+
+- **Username:** `btservant.45`
+- **Link + QR:** [`qr_codes/`](./qr_codes) — PNG + SVG + the regen command. Hand these out for
+  onboarding.
+
+Two things are **inherent Signal UX** and can't be removed by the gateway, even via the link:
+the one-time **"message request → Accept"** tap on first contact, and the **"unverified"**
+safety-number label (cosmetic; clears once the session establishes).
+
+> The username/link is tied to the account; if the username is ever deleted/reset the link
+> changes and the QR codes must be regenerated (see [`qr_codes/README.md`](./qr_codes/README.md)).
 
 ## Engine contract
 

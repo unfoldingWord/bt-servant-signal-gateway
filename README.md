@@ -36,10 +36,13 @@ Signal app  ⇄  signal-cli daemon (JSON-RPC + SSE)  ⇄  this gateway  ⇄  bt-
 
 ```
 src/bt_signal_gateway/
+├── __main__.py       # module entrypoint: `python -m bt_signal_gateway`
 ├── app.py            # async entrypoint (listener + callback server)
 ├── config.py         # typed settings
-├── signal_client.py  # signal-cli JSON-RPC client (send, reactions, attachments)
-├── signal_listener.py# inbound SSE listener
+├── logging_config.py # logging setup
+├── signal_client.py  # signal-cli JSON-RPC client (send, reactions, attachments) + markdown → Signal textStyles
+├── signal_listener.py# inbound SSE listener (reconnect/backoff + health monitor)
+├── signal_rate_limit.py # attachment-send pacing scheduler
 ├── envelope.py       # Signal envelope → InboundMessage
 ├── engine_client.py  # POST /api/v1/chat/callback (worker contract)
 ├── callback_server.py# FastAPI: /health, /progress-callback
@@ -63,7 +66,7 @@ production (`fly secrets set`), never committed.
 | Variable | Required | Default | Description |
 |---|---|---|---|
 | `SIGNAL_ACCOUNT` | ✅ | — | The bot's Signal number in E.164 (e.g. `+15551234567`); the linked-device account `signal-cli` runs as. |
-| `SIGNAL_HTTP_URL` |  | `http://127.0.0.1:8080` | Base URL of the local `signal-cli` daemon (JSON-RPC at `/api/v1/rpc`, SSE at `/api/v1/events`). |
+| `SIGNAL_HTTP_URL` |  | `http://127.0.0.1:8080` | Base URL of the local `signal-cli` daemon (JSON-RPC at `/api/v1/rpc`, SSE at `/api/v1/events`, health probe at `/api/v1/check`). |
 | `ENGINE_BASE_URL` | ✅ | — | Base URL of `bt-servant-worker`. Inbound messages POST to `{ENGINE_BASE_URL}/api/v1/chat/callback`. |
 | `ENGINE_ORG` |  | `unfoldingWord` | Organization slug sent as `org` on each request. |
 | `ENGINE_API_KEY` | ✅ | — | Bearer token for the worker **and** the shared secret the worker echoes back as `X-Engine-Token`. **Secret.** |
@@ -176,7 +179,9 @@ mounted at `/data` for signal-cli's account + double-ratchet state. The containe
 processes under `supervisord` (`supervisord.conf`): the `signal-cli` JSON-RPC daemon (loopback
 `127.0.0.1:8080`, never publicly exposed) and the Python gateway (callback server on `8081`,
 which Fly publishes as `GATEWAY_PUBLIC_URL`). Config lives in `fly.toml`; the build is the repo
-`Dockerfile`.
+`Dockerfile`, which pins **signal-cli ≥ 0.14.5** — a 2026-06 Signal server change makes older
+releases NPE and silently drop **all** incoming sealed-sender messages
+([AsamK/signal-cli#2059](https://github.com/AsamK/signal-cli/issues/2059)).
 
 > ⚠️ **Single instance only.** A Signal account can be primary in exactly one place — never run
 > two `signal-cli` daemons against one number (it corrupts the session). Scale-to-zero is disabled
@@ -355,7 +360,9 @@ This gateway implements the standard, channel-neutral BT Servant gateway contrac
 | `org` | `ENGINE_ORG` |
 | `chat_type` / `chat_id` / `speaker` | set for group messages (`chat_type="group"`) |
 
-The worker returns `202 Accepted` immediately.
+The worker returns `202 Accepted` immediately. A `429 CONCURRENT_REQUEST_REJECTED` is retried
+(up to 3 total attempts) honoring the response's `retry_after_ms` / `Retry-After` hint — the
+callback transport currently enqueues rather than 429-ing, so this is defensive.
 
 **Outbound (worker → gateway).** The worker POSTs progress to
 `{GATEWAY_PUBLIC_URL}/progress-callback`, guarded by the `X-Engine-Token` header (which must
@@ -365,17 +372,24 @@ slow signal-cli send never blocks the worker's webhook. `status` (text-less) is 
 `progress` splits its intermediate `text` at `CHUNK_SIZE` and sends each chunk as a **new** message
 (Signal has no in-place editing, but the sibling gateways don't edit either — they send new messages
 too); on `complete` it splits `text` at `CHUNK_SIZE` and sends each chunk via the `signal-cli`
-JSON-RPC `send` method; on `error` it sends a fixed fallback message. Replies route to the
-originating group (`chat_id`) or DM (`user_id`). Because the worker does not retry idempotently, the
-gateway **dedups `complete` on `message_key`** — `progress` is fire-and-forget and never deduped.
+JSON-RPC `send` method; on `error` it sends a fixed fallback message. Outbound text is converted
+from the worker's markdown to **native Signal formatting** (`textStyle` body ranges, UTF-16
+offsets): bold/italic/strikethrough, inline + fenced code as monospace, and headings as bold.
+Replies route to the originating group (`chat_id`) or DM (`user_id`). Because the worker does not
+retry idempotently, the gateway **dedups `complete` on `message_key`** with a deliver-then-mark
+discipline: a key is marked done only after full delivery (an in-flight set blocks concurrent
+duplicates), so a failed/partial send stays re-deliverable by a repeated callback — `progress` is
+fire-and-forget and never deduped.
 
 A 👀 reaction is placed on the inbound message when it's received; the terminal callback replaces it
 with ✅ (`complete`) or ❌ (`error`) — Signal keeps one reaction per author per message. Reactions
 are best-effort: a failure is logged and never blocks the relay or the reply.
 
-Media on `complete` is delivered after the text: a `voice_audio_url` (with `voice_audio_base64`
-fallback) is sent as a playable Signal **voice note**, and `attachments[]` (pdf/audio) are sent as
-file attachments (batched ≤32 per RPC, paced by the attachment rate-limit scheduler). All media is
+Media on `complete` is delivered after the text: a `voice_audio_url` (with a legacy
+`voice_audio_base64` fallback — the worker now sends `null` for it) is sent as a playable Signal
+**voice note**, and `attachments[]` (pdf/audio) are sent as file attachments (batched ≤32 per RPC,
+paced by the attachment rate-limit scheduler, with a courtesy "more files coming" message when an
+inter-batch pacing wait runs long). All media is
 downloaded HTTPS-only with the engine bearer token to a temp workspace signal-cli reads off the
 shared volume, then cleaned up. Inbound audio attachments are fetched, base64-encoded, and sent to
 the worker as an `audio` request; **non-audio inbound attachments are not yet relayed** (the

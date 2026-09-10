@@ -102,6 +102,20 @@ async def test_fetch_inbound_audio_format_defaults_to_aac() -> None:
     assert audio is not None and audio.audio_format == "aac"
 
 
+async def test_fetch_inbound_audio_fails_fast_on_3gp_content_type() -> None:
+    signal = _FakeSignalClient(b"x")
+    ref = AttachmentRef(id="a", content_type="audio/3gpp")
+    assert await fetch_inbound_audio(ref, cast(SignalClient, signal)) is None
+    assert signal.requested == []  # rejected before the getAttachment RPC
+
+
+async def test_fetch_inbound_audio_fails_fast_on_3gp_extension() -> None:
+    signal = _FakeSignalClient(b"x")
+    ref = AttachmentRef(id="a", filename="clip.3gp")
+    assert await fetch_inbound_audio(ref, cast(SignalClient, signal)) is None
+    assert signal.requested == []
+
+
 async def test_fetch_inbound_audio_rejects_declared_oversize() -> None:
     big = AttachmentRef(id="a", content_type="audio/aac", size=99)
     assert await fetch_inbound_audio(big, _signal(b"x"), max_bytes=10) is None

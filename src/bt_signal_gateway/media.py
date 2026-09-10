@@ -43,8 +43,9 @@ logger = logging.getLogger(__name__)
 #: Inbound audio cap (mirrors the WhatsApp gateway's 25 MB voice-message guard).
 MAX_INBOUND_AUDIO_BYTES = 25 * 1024 * 1024
 
-#: contentType -> worker ``audio_format`` hint.
-_AUDIO_MIME_TO_FORMAT = {
+#: contentType -> worker ``audio_format`` hint. ``None`` = known-unsupported:
+#: 3GP containers usually hold AMR, which the worker's STT cannot transcribe.
+_AUDIO_MIME_TO_FORMAT: dict[str, str | None] = {
     "audio/aac": "aac",
     "audio/mp4": "m4a",
     "audio/x-m4a": "m4a",
@@ -55,10 +56,10 @@ _AUDIO_MIME_TO_FORMAT = {
     "audio/wav": "wav",
     "audio/x-wav": "wav",
     "audio/webm": "webm",
-    "audio/3gpp": "3gp",
+    "audio/3gpp": None,
 }
 #: filename extension -> ``audio_format`` hint (fallback when contentType absent).
-_AUDIO_EXT_TO_FORMAT = {
+_AUDIO_EXT_TO_FORMAT: dict[str, str | None] = {
     ".aac": "aac",
     ".m4a": "m4a",
     ".mp4": "m4a",
@@ -68,7 +69,7 @@ _AUDIO_EXT_TO_FORMAT = {
     ".opus": "ogg",
     ".wav": "wav",
     ".webm": "webm",
-    ".3gp": "3gp",
+    ".3gp": None,
 }
 #: Default when nothing identifies the codec (Signal voice notes are AAC).
 _DEFAULT_AUDIO_FORMAT = "aac"
@@ -116,16 +117,20 @@ def select_inbound_audio(refs: list[AttachmentRef]) -> AttachmentRef | None:
     return None
 
 
-def _audio_format(ref: AttachmentRef) -> str:
-    """Best-effort worker ``audio_format`` for *ref* (contentType, then ext)."""
+def _audio_format(ref: AttachmentRef) -> str | None:
+    """Best-effort worker ``audio_format`` for *ref* (contentType, then ext).
+
+    ``None`` means known-unsupported (an explicit ``None`` mapping wins over
+    the default) — callers should fail fast instead of relaying.
+    """
     if ref.content_type:
-        fmt = _AUDIO_MIME_TO_FORMAT.get(ref.content_type.lower().split(";")[0].strip())
-        if fmt:
-            return fmt
+        mime = ref.content_type.lower().split(";")[0].strip()
+        if mime in _AUDIO_MIME_TO_FORMAT:
+            return _AUDIO_MIME_TO_FORMAT[mime]
     if ref.filename:
-        fmt = _AUDIO_EXT_TO_FORMAT.get(Path(ref.filename).suffix.lower())
-        if fmt:
-            return fmt
+        ext = Path(ref.filename).suffix.lower()
+        if ext in _AUDIO_EXT_TO_FORMAT:
+            return _AUDIO_EXT_TO_FORMAT[ext]
     return _DEFAULT_AUDIO_FORMAT
 
 
@@ -139,8 +144,16 @@ async def fetch_inbound_audio(
 
     Enforces *max_bytes* both from the declared size (pre-fetch, cheap) and the
     actual byte length (post-fetch). Returns ``None`` when the attachment is
-    missing or too large.
+    missing, too large, or in a known-unsupported format.
     """
+    audio_format = _audio_format(ref)
+    if audio_format is None:
+        logger.warning(
+            "media: unsupported inbound audio format (3gp/AMR); worker cannot transcribe",
+            extra={"id": ref.id, "content_type": ref.content_type, "file": ref.filename},
+        )
+        return None
+
     if ref.size is not None and ref.size > max_bytes:
         logger.warning(
             "media: inbound audio too large (declared)",
@@ -161,7 +174,7 @@ async def fetch_inbound_audio(
 
     return InboundAudio(
         audio_base64=base64.b64encode(data).decode("ascii"),
-        audio_format=_audio_format(ref),
+        audio_format=audio_format,
     )
 
 

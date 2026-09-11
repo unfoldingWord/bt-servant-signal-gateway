@@ -413,6 +413,97 @@ async def test_complete_with_attachments_sends_them() -> None:
     assert [p.split("/")[-1] for p in paths] == ["a.pdf", "b.pdf"]
 
 
+async def test_voice_reply_suppresses_text() -> None:
+    fake, client = _client()
+    url = "https://w/reply.m4a"
+    payload = CallbackPayload(
+        type="complete",
+        user_id=USER_ID,
+        message_key="k1",
+        text="the same content, spoken",
+        voice_audio_url=url,
+    )
+    http = _http_client({url: httpx.Response(200, content=b"voice-bytes")})
+    try:
+        ok = await dispatch_callback(payload, client, _settings(), http_client=http)
+    finally:
+        await http.aclose()
+
+    assert ok is True
+    assert len(fake.voice_notes) == 1
+    assert fake.sends == []  # voice delivered -> text suppressed
+
+
+async def test_voice_send_failure_falls_back_to_text() -> None:
+    fake, client = _client(voice_ok=False)
+    url = "https://w/reply.m4a"
+    payload = CallbackPayload(
+        type="complete",
+        user_id=USER_ID,
+        message_key="k1",
+        text="spoken content as text",
+        voice_audio_url=url,
+    )
+    http = _http_client({url: httpx.Response(200, content=b"voice-bytes")})
+    try:
+        ok = await dispatch_callback(payload, client, _settings(), http_client=http)
+    finally:
+        await http.aclose()
+
+    # Voice send failed -> the text fallback is the delivered reply.
+    assert ok is True
+    assert fake.sends == [(USER_ID, "spoken content as text")]
+
+
+async def test_voice_download_failure_falls_back_to_text() -> None:
+    fake, client = _client()
+    url = "https://w/reply.m4a"
+    payload = CallbackPayload(
+        type="complete",
+        user_id=USER_ID,
+        message_key="k1",
+        text="spoken content as text",
+        voice_audio_url=url,  # 404s; no base64 fallback
+    )
+    http = _http_client({url: httpx.Response(404)})
+    try:
+        ok = await dispatch_callback(payload, client, _settings(), http_client=http)
+    finally:
+        await http.aclose()
+
+    assert ok is True
+    assert fake.voice_notes == []
+    assert fake.sends == [(USER_ID, "spoken content as text")]
+
+
+async def test_voice_reply_still_delivers_attachments() -> None:
+    fake, client = _client()
+    voice_url = "https://w/reply.m4a"
+    payload = CallbackPayload(
+        type="complete",
+        user_id=USER_ID,
+        message_key="k1",
+        text="the same content, spoken",
+        voice_audio_url=voice_url,
+        attachments=[OutboundAttachment(url="https://w/a.pdf", filename="a.pdf")],
+    )
+    http = _http_client(
+        {
+            voice_url: httpx.Response(200, content=b"voice-bytes"),
+            "https://w/a.pdf": httpx.Response(200, content=b"pdf-a"),
+        }
+    )
+    try:
+        ok = await dispatch_callback(payload, client, _settings(), http_client=http)
+    finally:
+        await http.aclose()
+
+    assert ok is True
+    assert len(fake.voice_notes) == 1
+    assert len(fake.attachment_sends) == 1
+    assert fake.sends == []
+
+
 async def test_voice_send_failure_marks_incomplete() -> None:
     _fake, client = _client(voice_ok=False)
     url = "https://w/reply.m4a"

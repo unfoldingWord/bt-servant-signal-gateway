@@ -23,14 +23,24 @@ ENV DEBIAN_FRONTEND=noninteractive \
     UV_LINK_MODE=copy \
     PATH=/app/.venv/bin:$PATH
 
-# System deps: Python 3.12 (default on noble), supervisor (process manager), and curl/certs
-# for the signal-cli download.
+# System deps: Python 3.12 (default on noble), supervisor (process manager), curl/certs
+# for the signal-cli download, and media-types for /etc/mime.types — signal-cli stamps
+# outbound attachment content types via Java's Files.probeContentType, which reads
+# /etc/mime.types on Linux. Without it every voice note goes out as
+# application/octet-stream and Signal clients render a generic file card instead of the
+# inline voice-note player, even with the voiceNote flag set (issue #49). The greps
+# fail the build if a future base-image/package change drops the audio mappings we
+# depend on (.opus/.ogg for worker TTS replies, .m4a for the extension-less fallback).
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         python3 \
         supervisor \
         curl \
         ca-certificates \
+        media-types \
+    && grep -Eq '^audio/ogg[[:space:]].*[[:space:]]opus([[:space:]]|$)' /etc/mime.types \
+    && grep -Eq '^audio/ogg[[:space:]].*[[:space:]]ogg([[:space:]]|$)' /etc/mime.types \
+    && grep -Eq '^audio/mp4[[:space:]].*[[:space:]]m4a([[:space:]]|$)' /etc/mime.types \
     && rm -rf /var/lib/apt/lists/*
 
 # signal-cli (pinned). The release tarball ships its own native libsignal for glibc.

@@ -24,7 +24,11 @@ Per the worker's ``ChatRequest`` contract
   sender's display name as ``speaker``;
 - a ``429 CONCURRENT_REQUEST_REJECTED`` carries ``retry_after_ms`` (and a
   ``Retry-After`` header) which we honor with a bounded retry. The callback
-  transport currently enqueues rather than 429-ing, but we handle it defensively.
+  transport currently enqueues rather than 429-ing, but we handle it defensively;
+- ``voice_format="aac"`` asks the worker's TTS for AAC voice replies: Signal
+  clients render AAC as an inline voice bubble but show Opus (the worker's
+  default) as a click-to-open file card, regardless of MIME type or the
+  ``voiceNote`` flag (worker#426).
 """
 
 from __future__ import annotations
@@ -75,6 +79,7 @@ def build_chat_request(
         "progress_callback_url": settings.progress_callback_url,
         "progress_mode": "iteration",
         "progress_throttle_seconds": 3,
+        "voice_format": "aac",
         "org": settings.engine_org,
     }
     if audio:

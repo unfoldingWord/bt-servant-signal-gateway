@@ -357,6 +357,7 @@ This gateway implements the standard, channel-neutral BT Servant gateway contrac
 | `message_key` | the Signal message timestamp (used for dedup) |
 | `progress_callback_url` | `{GATEWAY_PUBLIC_URL}/progress-callback` |
 | `progress_mode` | `"iteration"` (+ `progress_throttle_seconds: 3`) — the worker streams intermediate updates we relay as new messages, matching the Telegram/WhatsApp gateways |
+| `voice_format` | `"aac"` — Signal clients render AAC as an inline voice bubble but show Opus (the worker's default) as a click-to-open file card, so the worker synthesizes TTS replies as AAC for this channel |
 | `org` | `ENGINE_ORG` |
 | `chat_type` / `chat_id` / `speaker` | set for group messages (`chat_type="group"`) |
 

@@ -97,6 +97,7 @@ def test_build_chat_request_dm_shape() -> None:
         "progress_callback_url": "https://gw.fly.dev/progress-callback",
         "progress_mode": "iteration",
         "progress_throttle_seconds": 3,
+        "voice_format": "aac",
         "org": "unfoldingWord",
     }
     # DMs carry no group-context fields.
@@ -111,6 +112,14 @@ def test_build_chat_request_uses_iteration_mode_with_throttle() -> None:
     body = build_chat_request(_dm_message(), _settings())
     assert body["progress_mode"] == "iteration"
     assert body["progress_throttle_seconds"] == 3
+
+
+def test_build_chat_request_requests_aac_voice() -> None:
+    # Signal renders AAC as an inline voice bubble but shows Opus (the worker's
+    # default) as a click-to-open file card (issue #51), so every request asks
+    # the worker's TTS for AAC output.
+    body = build_chat_request(_dm_message(), _settings())
+    assert body["voice_format"] == "aac"
 
 
 def test_build_chat_request_group_shape() -> None:

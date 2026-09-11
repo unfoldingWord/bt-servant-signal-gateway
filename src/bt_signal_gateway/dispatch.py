@@ -8,9 +8,13 @@ no text and is dropped at the server layer; this module handles the rest:
   Signal message (no media, not deduped). Signal has no message editing, but the
   sibling gateways don't edit either — they send new messages, which Signal does
   fine. Gives the user "…working on it" updates instead of silence.
-- ``complete`` — chunk ``text`` to ``CHUNK_SIZE`` and send each chunk to the
-  originating DM or group, then deliver any media: a ``voice_audio_url`` /
-  ``voice_audio_base64`` voice note and ``attachments[]`` files, then a ✅ react.
+- ``complete`` — voice-first, mirroring the WhatsApp gateway: when the payload
+  carries a voice reply (``voice_audio_url`` / ``voice_audio_base64``), deliver
+  it as a Signal voice note and **suppress the text** — the text is the same
+  content, and a voice question should get exactly one voice answer. The
+  chunked ``text`` is sent only when there is no voice reply or voice delivery
+  failed (fallback, so the user is never left with silence). ``attachments[]``
+  files are delivered either way, then a ✅ react.
 - ``error`` — send a fixed fallback message so the user isn't left hanging, plus
   a ❌ react.
 
@@ -204,23 +208,28 @@ async def dispatch_callback(
     """Deliver a ``progress`` / ``complete`` / ``error`` callback to Signal.
 
     ``progress`` chunks the intermediate ``text`` and sends each chunk as a new
-    message (no media, no dedup, no reaction). ``complete`` chunks ``text``, then
-    delivers any media (voice note + file attachments), then places a ✅ reaction;
-    a reply with neither text nor media still reacts. ``error`` sends the fallback
-    message and places a ❌ reaction. ``status`` (text-less) is a no-op — the
-    server layer already filters it. Per-item send failures are logged but do not
-    abort the rest of the reply; reaction failures are cosmetic and never change
-    the return value.
+    message (no media, no dedup, no reaction). ``complete`` is voice-first: a
+    voice reply is delivered as a Signal voice note and the text is suppressed
+    (it duplicates the spoken content); text chunks are sent only when there is
+    no voice reply or voice delivery failed. File attachments are delivered
+    either way, then a ✅ reaction is placed; a reply with neither text nor
+    media still reacts. ``error`` sends the fallback message and places a ❌
+    reaction. ``status`` (text-less) is a no-op — the server layer already
+    filters it. Per-item send failures are logged but do not abort the rest of
+    the reply; reaction failures are cosmetic and never change the return value.
 
     ``http_client`` injects an :class:`httpx.AsyncClient` for media downloads
     (tests); when omitted a short-lived client is created and closed here.
 
-    Returns ``True`` when delivery is fully accounted for (every chunk + all
-    media sent, the fallback sent, or there was nothing to send) and ``False``
-    when any send failed. The caller uses this to decide whether to mark the
-    ``message_key`` as completed: a ``False`` leaves the key eligible for
-    re-delivery so a repeated callback can finish the reply. ``progress`` returns
-    are advisory (the server fire-and-forgets them; they're never deduped).
+    Returns ``True`` when delivery is fully accounted for: the voice note sent
+    (suppressed text counts as delivered), or the text fully sent (as primary
+    reply or as fallback after a failed voice delivery), or there was nothing
+    to send — and all attachments delivered. Returns ``False`` when the reply
+    could not be delivered (including a failed voice with no text to fall back
+    to). The caller uses this to decide whether to mark the ``message_key`` as
+    completed: a ``False`` leaves the key eligible for re-delivery so a repeated
+    callback can finish the reply. ``progress`` returns are advisory (the server
+    fire-and-forgets them; they're never deduped).
     """
     recipient = _recipient(payload)
     log_ctx = {
@@ -250,81 +259,85 @@ async def dispatch_callback(
         logger.debug("callback: ignoring non-terminal type", extra=log_ctx)
         return True
 
-    has_media = bool(payload.voice_audio_url or payload.voice_audio_base64 or payload.attachments)
-    sent, expected = await _send_text_chunks(
-        payload.text, signal_client, settings, recipient, log_ctx
-    )
-    if expected == 0 and not has_media:
-        logger.info("callback: complete with empty text, nothing to send", extra=log_ctx)
-        await _react(payload, signal_client, _COMPLETE_REACTION, log_ctx)
-        return True
+    has_voice = bool(payload.voice_audio_url or payload.voice_audio_base64)
 
-    logger.info(
-        "callback: dispatching complete",
-        extra={**log_ctx, "chunks": expected, "has_media": has_media},
-    )
-    text_ok = sent == expected
+    sent = 0
+    expected = 0
+    voice_ok = False
+    attachments_ok = True
 
-    media_ok = True
-    if has_media:
-        media_ok = await _deliver_media(
-            payload, signal_client, settings, recipient, log_ctx, http_client
+    if has_voice or payload.attachments:
+        logger.info(
+            "callback: dispatching complete",
+            extra={
+                **log_ctx,
+                "has_voice": has_voice,
+                "attachment_count": len(payload.attachments),
+            },
         )
+        # One per-delivery temp workspace + download client for all media,
+        # removed/closed wholesale after the send.
+        owns_client = http_client is None
+        client = http_client or httpx.AsyncClient(timeout=_DOWNLOAD_TIMEOUT_S)
+        try:
+            with temp_workspace() as workspace:
+                if has_voice:
+                    voice_ok = await _deliver_voice_note(
+                        payload, signal_client, settings, recipient, workspace, client, log_ctx
+                    )
+                # Voice-first: a delivered voice note suppresses the text (it
+                # duplicates the spoken content); text is the fallback so a
+                # failed voice delivery never leaves the user with silence.
+                if not voice_ok:
+                    sent, expected = await _send_text_chunks(
+                        payload.text, signal_client, settings, recipient, log_ctx
+                    )
+                if payload.attachments:
+                    attachments_ok = await _deliver_attachments(
+                        payload.attachments,
+                        signal_client,
+                        settings,
+                        recipient,
+                        workspace,
+                        client,
+                        log_ctx,
+                    )
+        finally:
+            if owns_client:
+                await client.aclose()
+    else:
+        sent, expected = await _send_text_chunks(
+            payload.text, signal_client, settings, recipient, log_ctx
+        )
+        if expected == 0:
+            logger.info("callback: complete with empty text, nothing to send", extra=log_ctx)
+            await _react(payload, signal_client, _COMPLETE_REACTION, log_ctx)
+            return True
+
+    if has_voice and voice_ok:
+        reply_ok = True  # text deliberately suppressed — the voice note is the reply
+    elif expected > 0:
+        reply_ok = sent == expected
+    elif has_voice:
+        reply_ok = False  # voice failed and there was no text to fall back to
+    else:
+        reply_ok = True  # attachments-only complete: no voice, no text
 
     await _react(payload, signal_client, _COMPLETE_REACTION, log_ctx)
 
-    fully_delivered = text_ok and media_ok
+    fully_delivered = reply_ok and attachments_ok
     logger.info(
         "callback: complete dispatched",
         extra={
             **log_ctx,
+            "voice_ok": voice_ok if has_voice else None,
             "sent": sent,
             "expected": expected,
-            "media_ok": media_ok,
+            "attachments_ok": attachments_ok,
             "delivered": fully_delivered,
         },
     )
     return fully_delivered
-
-
-async def _deliver_media(
-    payload: CallbackPayload,
-    signal_client: SignalClient,
-    settings: Settings,
-    recipient: str,
-    log_ctx: dict[str, Any],
-    http_client: httpx.AsyncClient | None,
-) -> bool:
-    """Download and deliver the voice note + file attachments on a ``complete``.
-
-    Everything goes through one per-delivery temp workspace, removed wholesale on
-    exit. Returns ``True`` only when every media item is delivered.
-    """
-    owns_client = http_client is None
-    client = http_client or httpx.AsyncClient(timeout=_DOWNLOAD_TIMEOUT_S)
-    try:
-        with temp_workspace() as workspace:
-            ok = True
-            if payload.voice_audio_url or payload.voice_audio_base64:
-                if not await _deliver_voice_note(
-                    payload, signal_client, settings, recipient, workspace, client, log_ctx
-                ):
-                    ok = False
-            if payload.attachments:
-                if not await _deliver_attachments(
-                    payload.attachments,
-                    signal_client,
-                    settings,
-                    recipient,
-                    workspace,
-                    client,
-                    log_ctx,
-                ):
-                    ok = False
-            return ok
-    finally:
-        if owns_client:
-            await client.aclose()
 
 
 async def _deliver_voice_note(

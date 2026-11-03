@@ -328,6 +328,42 @@ async def test_in_flight_start_stops_if_the_turn_finishes_first() -> None:
     assert signal.typing[-1] == ("u", True)
 
 
+async def test_older_in_flight_start_does_not_stop_when_its_turn_finishes_first() -> None:
+    # A's start is still in flight, B has started (its own start failed and
+    # released the ticket) and is not finished. Finishing A must not stop the
+    # chat: B is still open, even though the chat ticket is currently empty.
+    release = asyncio.Event()
+    started = asyncio.Event()
+
+    class _SlowSignal:
+        def __init__(self) -> None:
+            self.typing: list[tuple[str, bool]] = []
+
+        async def send_typing(self, chat_id: str, *, stop: bool = False) -> bool:
+            self.typing.append((chat_id, stop))
+            if not stop:
+                started.set()
+                await release.wait()
+            return True
+
+    typing = TypingIndicators()
+    signal = _SlowSignal()
+    assert typing.try_acquire("u", "A") is True
+    ticket = typing.current_ticket("u")
+    assert ticket is not None
+    task = asyncio.create_task(send_typing_start(cast(SignalClient, signal), typing, "u", ticket))
+    await asyncio.wait_for(started.wait(), timeout=1)
+    assert typing.try_acquire("u", "B") is True
+    newer = typing.current_ticket("u")
+    assert newer is not None
+    typing.release("u", newer)
+    assert typing.finish("u", "A") is False
+    release.set()
+    await task
+    assert signal.typing == [("u", False)]
+    assert typing.finish("u", "B") is True
+
+
 async def test_older_in_flight_start_does_not_stop_a_newer_turn() -> None:
     release = asyncio.Event()
     started = asyncio.Event()

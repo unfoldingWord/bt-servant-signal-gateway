@@ -6,6 +6,10 @@ seconds, so a start for the *same* turn is allowed at most once in that
 window. A different message in the same chat is a new turn and starts
 immediately. A turn marked finished (``complete`` / ``error``) is never
 started again, which keeps a late ``status`` from bringing the indicator back.
+
+Signal has one indicator per conversation. Finishing a turn does not send
+stop while a turn that started later in that chat is still open, so the
+newer question keeps "typing…" until it finishes too.
 """
 
 from __future__ import annotations
@@ -51,6 +55,8 @@ class TypingIndicators:
         self._last_sent: dict[str, float] = {}
         self._active_key: dict[str, str] = {}
         self._finished: OrderedDict[str, None] = OrderedDict()
+        # message_keys that have started and not yet finished, in start order.
+        self._open: dict[str, OrderedDict[str, None]] = {}
         self._ticket: dict[str, int] = {}
         self._next_ticket = 0
 
@@ -72,6 +78,7 @@ class TypingIndicators:
             return False
         self._last_sent[chat_id] = now
         self._active_key[chat_id] = message_key
+        self._note_open(chat_id, message_key)
         self._next_ticket += 1
         self._ticket[chat_id] = self._next_ticket
         return True
@@ -94,17 +101,29 @@ class TypingIndicators:
         self._last_sent.pop(chat_id, None)
         self._ticket.pop(chat_id, None)
 
-    def finish(self, chat_id: str, message_key: str) -> bool:
-        """Mark *message_key* finished. True only the first time.
+    def has_open_turn(self, chat_id: str) -> bool:
+        """True when some turn in *chat_id* has started and not finished."""
+        return bool(self._open.get(chat_id))
 
-        Clears the chat throttle so the next turn can show typing immediately,
-        and drops any in-flight start ticket so that start cannot leave the
-        indicator up after the stop. The caller sends the stop RPC only when
-        this returns True.
+    def finish(self, chat_id: str, message_key: str) -> bool:
+        """Mark *message_key* finished.
+
+        True only the first time, and only when no later turn in this chat is
+        still open. Signal has one indicator per conversation, so a stop while
+        a newer turn is running would hide "typing…" for that turn. The caller
+        sends the stop RPC only when this returns True.
+
+        The chat reserve stays with the newer turn. It is cleared only when
+        the stop should go out, so an in-flight start cannot leave the
+        indicator up after that stop.
         """
         if message_key in self._finished:
             return False
+        keep_up = self._later_turn_still_open(chat_id, message_key)
         self._remember_finished(message_key)
+        self._close_turn(chat_id, message_key)
+        if keep_up:
+            return False
         self._drop_chat_reserve(chat_id)
         return True
 
@@ -112,15 +131,38 @@ class TypingIndicators:
         """Drop the chat reserve after the relay to the worker fails.
 
         Does not mark a turn finished: nothing was submitted, so there is no
-        late ``status`` to keep dark. An in-flight start sees the missing
-        ticket and sends a stop when its RPC returns.
+        late ``status`` to keep dark. Forgets every open turn in the chat so
+        a message that never reached the worker cannot keep a later stop from
+        being sent. An in-flight start sees the missing ticket and sends a
+        stop when its RPC returns.
         """
+        self._open.pop(chat_id, None)
         self._drop_chat_reserve(chat_id)
 
     def _remember_finished(self, message_key: str) -> None:
         self._finished[message_key] = None
         while len(self._finished) > self._finished_cap:
             self._finished.popitem(last=False)
+
+    def _note_open(self, chat_id: str, message_key: str) -> None:
+        opened = self._open.setdefault(chat_id, OrderedDict())
+        if message_key not in opened:
+            opened[message_key] = None
+
+    def _later_turn_still_open(self, chat_id: str, message_key: str) -> bool:
+        opened = self._open.get(chat_id)
+        if not opened or message_key not in opened:
+            return False
+        keys = list(opened)
+        return keys.index(message_key) < len(keys) - 1
+
+    def _close_turn(self, chat_id: str, message_key: str) -> None:
+        opened = self._open.get(chat_id)
+        if opened is None:
+            return
+        opened.pop(message_key, None)
+        if not opened:
+            self._open.pop(chat_id, None)
 
     def _drop_chat_reserve(self, chat_id: str) -> None:
         self._last_sent.pop(chat_id, None)
@@ -137,8 +179,9 @@ async def send_typing_start(
     """Send a start indicator. A failure is logged and the reserve released.
 
     *ticket* is the one :meth:`TypingIndicators.try_acquire` just issued. If
-    that reserve is gone when the RPC returns and nothing newer replaced it,
-    a stop is sent so a cancel that won the race cannot leave "typing…" up.
+    that reserve is gone when the RPC returns and no turn in the chat is
+    still open, a stop is sent so a cancel that won the race cannot leave
+    "typing…" up. A newer turn that is still open keeps the indicator.
     """
     if not typing.holds_ticket(chat_id, ticket):
         return
@@ -155,7 +198,7 @@ async def send_typing_start(
         typing.release(chat_id, ticket)
         logger.warning("typing indicator failed", extra={"chat_id": chat_id})
         return
-    if not typing.holds_ticket(chat_id, ticket) and typing.current_ticket(chat_id) is None:
+    if not typing.holds_ticket(chat_id, ticket) and not typing.has_open_turn(chat_id):
         await send_typing_stop(signal_client, chat_id)
 
 

@@ -303,6 +303,39 @@ def test_status_then_complete_then_late_status_sends_one_start_and_one_stop() ->
     assert fake.typing == [(USER_ID, False), (USER_ID, True)]
 
 
+def test_older_complete_keeps_typing_while_a_newer_turn_is_open() -> None:
+    # Signal has one indicator per conversation. A and B in the same DM: when
+    # A completes, B is still in the worker, so the stop waits until B completes.
+    clock = {"now": 1_000.0}
+    fake, client = _client(now=lambda: clock["now"])
+    status_a = {"type": "status", "user_id": USER_ID, "message_key": "A", "text": "working"}
+    status_b = {"type": "status", "user_id": USER_ID, "message_key": "B", "text": "next"}
+
+    assert _post(client, status_a).status_code == 200
+    clock["now"] = 1_001.0
+    assert _post(client, status_b).status_code == 200
+    assert fake.typing == [(USER_ID, False), (USER_ID, False)]
+
+    assert _post(client, _complete_body("A")).status_code == 200
+    assert fake.sends == [(USER_ID, "hello there")]
+    assert fake.typing == [(USER_ID, False), (USER_ID, False)]
+    assert "stop" not in fake.events
+
+    # A's late status must not restart the indicator, and B's refresh inside
+    # the window must not send a second start: B's indicator is still up.
+    assert _post(client, status_a).status_code == 200
+    clock["now"] = 1_005.0
+    assert _post(client, status_b).status_code == 200
+    assert fake.typing == [(USER_ID, False), (USER_ID, False)]
+    assert fake.sends == [(USER_ID, "hello there")]
+
+    assert _post(client, _complete_body("B")).status_code == 200
+    assert fake.sends == [(USER_ID, "hello there"), (USER_ID, "hello there")]
+    assert fake.typing == [(USER_ID, False), (USER_ID, False), (USER_ID, True)]
+    _assert_message_before_stop(fake)
+    assert fake.events[-2:] == ["send", "stop"]
+
+
 def test_finished_turn_does_not_block_typing_for_a_new_message() -> None:
     fake, client = _client()
     assert _post(client, _complete_body("k1")).status_code == 200

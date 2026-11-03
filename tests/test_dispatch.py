@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+from pathlib import Path
 from typing import cast
 
 import httpx
@@ -410,7 +411,7 @@ async def test_complete_with_attachments_sends_them() -> None:
     assert len(fake.attachment_sends) == 1
     recipient, paths = fake.attachment_sends[0]
     assert recipient == USER_ID
-    assert [p.split("/")[-1] for p in paths] == ["a.pdf", "b.pdf"]
+    assert [Path(p).name for p in paths] == ["a.pdf", "b.pdf"]
 
 
 async def test_voice_reply_suppresses_text() -> None:

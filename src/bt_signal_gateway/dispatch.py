@@ -2,7 +2,8 @@
 
 The worker calls back into ``/progress-callback`` with one of four payload
 types (``status`` / ``progress`` / ``complete`` / ``error``). ``status`` carries
-no text and is dropped at the server layer; this module handles the rest:
+no text; the server layer turns it into a Signal typing indicator and this
+module does not send a message for it. This module handles the rest:
 
 - ``progress`` — chunk the intermediate ``text`` and send each chunk as a *new*
   Signal message (no media, not deduped). Signal has no message editing, but the
@@ -214,9 +215,10 @@ async def dispatch_callback(
     no voice reply or voice delivery failed. File attachments are delivered
     either way, then a ✅ reaction is placed; a reply with neither text nor
     media still reacts. ``error`` sends the fallback message and places a ❌
-    reaction. ``status`` (text-less) is a no-op — the server layer already
-    filters it. Per-item send failures are logged but do not abort the rest of
-    the reply; reaction failures are cosmetic and never change the return value.
+    reaction. ``status`` (text-less) is a no-op here — the server layer already
+    turned it into a typing indicator. Per-item send failures are logged but do
+    not abort the rest of the reply; reaction failures are cosmetic and never
+    change the return value.
 
     ``http_client`` injects an :class:`httpx.AsyncClient` for media downloads
     (tests); when omitted a short-lived client is created and closed here.

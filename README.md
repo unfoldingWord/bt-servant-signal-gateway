@@ -28,11 +28,12 @@ Signal app  ⇄  signal-cli daemon (JSON-RPC + SSE)  ⇄  this gateway  ⇄  bt-
 ```
 
 - **Inbound:** subscribe to signal-cli's SSE event stream → normalize → `POST /api/v1/chat/callback`
-  on the worker (`client_id="signal-gateway"`, `progress_mode="iteration"`); a best-effort 👀
-  reaction acknowledges receipt.
+  on the worker (`client_id="signal-gateway"`, `progress_mode="iteration"`); a best-effort typing
+  indicator and 👀 reaction acknowledge receipt.
 - **Outbound:** the worker calls back `{GATEWAY_PUBLIC_URL}/progress-callback` → chunk + send via
-  signal-cli JSON-RPC. Intermediate `progress` updates stream as new messages; on `complete`/`error`
-  the 👀 is replaced with ✅/❌.
+  signal-cli JSON-RPC. `status` refreshes the typing indicator (no chat message); intermediate
+  `progress` updates still stream as new messages; on `complete`/`error` typing stops and the 👀
+  is replaced with ✅/❌.
 
 ```
 src/bt_signal_gateway/
@@ -40,7 +41,7 @@ src/bt_signal_gateway/
 ├── app.py            # async entrypoint (listener + callback server)
 ├── config.py         # typed settings
 ├── logging_config.py # logging setup
-├── signal_client.py  # signal-cli JSON-RPC client (send, reactions, attachments) + markdown → Signal textStyles
+├── signal_client.py  # signal-cli JSON-RPC client (send, sendTyping, reactions, attachments) + markdown → Signal textStyles
 ├── signal_listener.py# inbound SSE listener (reconnect/backoff + health monitor)
 ├── signal_rate_limit.py # attachment-send pacing scheduler
 ├── envelope.py       # Signal envelope → InboundMessage
@@ -49,7 +50,8 @@ src/bt_signal_gateway/
 ├── dispatch.py       # worker callback → Signal reply (text + media)
 ├── media.py          # inbound audio encode + outbound media download
 ├── chunking.py       # message splitting
-└── dedup.py          # message_key TTL dedup
+├── dedup.py          # message_key TTL dedup
+└── typing_indicator.py # per-chat typing throttle + stop on complete/error
 ```
 
 ## Requirements
@@ -369,8 +371,12 @@ callback transport currently enqueues rather than 429-ing, so this is defensive.
 `{GATEWAY_PUBLIC_URL}/progress-callback`, guarded by the `X-Engine-Token` header (which must
 equal `ENGINE_API_KEY`; a missing/wrong token gets `401`). Payloads are typed `status` /
 `progress` / `complete` / `error`. The gateway acks quickly and delivers off the ack path, so a
-slow signal-cli send never blocks the worker's webhook. `status` (text-less) is acked and dropped;
-`progress` splits its intermediate `text` at `CHUNK_SIZE` and sends each chunk as a **new** message
+slow signal-cli send never blocks the worker's webhook. `status` (no chat text) is acked and
+refreshes signal-cli's `sendTyping` indicator for that chat — at most once every 10 seconds, the
+cadence Signal uses to keep its ~15 second indicator visible — and never becomes a message. On
+`complete` or `error` the gateway sends `sendTyping` with `stop: true`, and a later `status` for
+that `message_key` does not start it again. `progress` splits its intermediate `text` at
+`CHUNK_SIZE` and sends each chunk as a **new** message
 (Signal has no in-place editing, but the sibling gateways don't edit either — they send new messages
 too); on `complete` it splits `text` at `CHUNK_SIZE` and sends each chunk via the `signal-cli`
 JSON-RPC `send` method; on `error` it sends a fixed fallback message. Outbound text is converted

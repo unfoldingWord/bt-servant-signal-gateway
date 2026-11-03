@@ -22,6 +22,7 @@ from bt_signal_gateway.logging_config import configure_logging
 from bt_signal_gateway.media import fetch_inbound_audio, select_inbound_audio
 from bt_signal_gateway.signal_client import SignalClient
 from bt_signal_gateway.signal_listener import InboundHandler, run_listener
+from bt_signal_gateway.typing_indicator import TypingIndicators, send_typing_start
 
 logger = logging.getLogger(__name__)
 
@@ -30,6 +31,7 @@ def _make_inbound_handler(
     engine_client: EngineClient,
     signal_client: SignalClient,
     settings: Settings,
+    typing: TypingIndicators | None = None,
 ) -> InboundHandler:
     """Build the listener handler that relays accepted messages to the worker.
 
@@ -38,12 +40,20 @@ def _make_inbound_handler(
     (its inbound contract is text/audio only), so they're dropped with a log and
     any caption text still goes through as a text message.
 
-    On receipt the message gets a best-effort 👀 reaction so the user sees instant
-    confirmation; the terminal callback later replaces it with ✅/❌. A reaction
-    failure is logged and never blocks the relay.
+    On receipt the chat gets a best-effort typing indicator (before the worker
+    round-trip) and a 👀 reaction so the user sees instant confirmation; the
+    terminal callback later replaces the reaction with ✅/❌ and stops typing.
+    Either failure is logged and never blocks the relay. *typing* is the same
+    gate the callback server uses, so a ``status`` callback inside the refresh
+    window does not send a second indicator.
     """
+    indicators = typing or TypingIndicators()
 
     async def _relay(message: InboundMessage) -> None:
+        message_key = str(message.timestamp_ms)
+        if indicators.try_acquire(message.chat_id, message_key):
+            await send_typing_start(signal_client, indicators, message.chat_id)
+
         try:
             await signal_client.send_reaction(
                 message.chat_id, "👀", message.user_id, message.timestamp_ms
@@ -108,9 +118,10 @@ async def run() -> None:
 
     signal_client = SignalClient(settings)
     engine_client = EngineClient(settings)
+    typing = TypingIndicators()
 
     config = uvicorn.Config(
-        create_app(signal_client=signal_client, settings=settings),
+        create_app(signal_client=signal_client, settings=settings, typing=typing),
         host=settings.host,
         port=settings.port,
         log_config=None,
@@ -119,7 +130,7 @@ async def run() -> None:
     listener_task = asyncio.create_task(
         run_listener(
             settings,
-            handler=_make_inbound_handler(engine_client, signal_client, settings),
+            handler=_make_inbound_handler(engine_client, signal_client, settings, typing),
             signal_client=signal_client,
         ),
         name="signal-listener",

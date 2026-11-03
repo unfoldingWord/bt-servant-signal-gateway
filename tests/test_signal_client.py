@@ -400,3 +400,49 @@ async def test_get_attachment_missing_returns_none() -> None:
     daemon.script("getAttachment", {"result": None})
     client = _make_client(daemon)
     assert await client.get_attachment("att-1") is None
+
+
+# ---------------------------------------------------------------------------
+# sendTyping — native typing indicator
+# ---------------------------------------------------------------------------
+
+
+async def test_send_typing_dm_starts_indicator() -> None:
+    daemon = FakeDaemon()
+    client = _make_client(daemon)
+    assert await client.send_typing(PEER) is True
+
+    (call,) = daemon.calls("sendTyping")
+    params = call["params"]
+    assert params["account"] == ACCOUNT
+    assert params["recipient"] == [PEER]
+    assert params["stop"] is False
+    assert "groupId" not in params
+
+
+async def test_send_typing_group_can_stop() -> None:
+    daemon = FakeDaemon()
+    client = _make_client(daemon)
+    assert await client.send_typing("group:abc123==", stop=True) is True
+
+    (call,) = daemon.calls("sendTyping")
+    params = call["params"]
+    assert params["groupId"] == "abc123=="
+    assert params["stop"] is True
+    assert "recipient" not in params
+    assert params["account"] == ACCOUNT
+
+
+async def test_send_typing_rpc_error_returns_false() -> None:
+    daemon = FakeDaemon()
+    daemon.script("sendTyping", {"error": {"code": -1, "message": "untrusted identity"}})
+    client = _make_client(daemon)
+    assert await client.send_typing(PEER) is False
+
+
+async def test_send_typing_null_result_is_success() -> None:
+    # signal-cli's sendTyping is void and may reply with JSON null.
+    daemon = FakeDaemon()
+    daemon.script("sendTyping", {"result": None})
+    client = _make_client(daemon)
+    assert await client.send_typing(PEER_UUID) is True

@@ -140,9 +140,18 @@ def parse_callback_payload(body: Any) -> CallbackPayload | None:
     )
 
 
+def chat_id_for(*, user_id: str, chat_id: str | None) -> str:
+    """Chat a callback addresses: the group id, or the DM sender.
+
+    Groups arrive with ``chat_id`` ``group:<groupId>``. DMs omit it and the
+    Signal recipient is ``user_id``. Typing indicators use this same value.
+    """
+    return chat_id or user_id
+
+
 def _recipient(payload: CallbackPayload) -> str:
     """Signal recipient for *payload*: the group ``chat_id`` or the DM sender."""
-    return payload.chat_id or payload.user_id
+    return chat_id_for(user_id=payload.user_id, chat_id=payload.chat_id)
 
 
 async def _react(

@@ -264,8 +264,10 @@ class SignalClient:
         ``raise_on_rate_limit=True``, a Signal ``[429]`` / ``RateLimitException``
         response raises :class:`SignalRateLimitError` instead of returning
         ``None`` — lets the attachment path opt into backoff-retry. When
-        ``none_result_ok=True``, a present JSON ``null`` result counts as
-        success (void methods such as ``sendTyping``).
+        ``none_result_ok=True``, a present JSON ``null`` result — or a body
+        with no ``result`` key and no ``error`` — counts as success. signal-cli
+        marks ``result`` ``@JsonInclude(NON_NULL)``, so a null success payload
+        is omitted entirely (void methods such as ``sendTyping``).
         """
         rpc_id = f"{method}_{int(time.time() * 1000)}"
         payload = {
@@ -297,9 +299,11 @@ class SignalClient:
                 return None
 
             result = data.get("result")
-            # Void RPCs such as sendTyping may reply with JSON null. That is
-            # success when the caller opts in; a missing result stays a failure.
-            if result is None and none_result_ok and "result" in data:
+            # Void RPCs such as sendTyping may reply with JSON null, or omit
+            # result: signal-cli serializes a null success with no result key
+            # and no error key. Other methods still treat a missing result as
+            # failure.
+            if result is None and none_result_ok and "error" not in data:
                 return True
             return result
 

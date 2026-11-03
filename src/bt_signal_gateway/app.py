@@ -10,7 +10,9 @@ from __future__ import annotations
 import asyncio
 import logging
 import signal
+from collections.abc import Coroutine
 from contextlib import suppress
+from typing import Any
 
 import uvicorn
 
@@ -22,7 +24,7 @@ from bt_signal_gateway.logging_config import configure_logging
 from bt_signal_gateway.media import fetch_inbound_audio, select_inbound_audio
 from bt_signal_gateway.signal_client import SignalClient
 from bt_signal_gateway.signal_listener import InboundHandler, run_listener
-from bt_signal_gateway.typing_indicator import TypingIndicators, send_typing_start
+from bt_signal_gateway.typing_indicator import TypingIndicators, send_typing_start, send_typing_stop
 
 logger = logging.getLogger(__name__)
 
@@ -43,16 +45,29 @@ def _make_inbound_handler(
     On receipt the chat gets a best-effort typing indicator (before the worker
     round-trip) and a 👀 reaction so the user sees instant confirmation; the
     terminal callback later replaces the reaction with ✅/❌ and stops typing.
-    Either failure is logged and never blocks the relay. *typing* is the same
-    gate the callback server uses, so a ``status`` callback inside the refresh
-    window does not send a second indicator.
+    Either failure is logged and never blocks the relay. The typing RPC is not
+    awaited: a slow ``sendTyping`` must not delay the reaction or the post to
+    the worker. *typing* is the same gate the callback server uses, so a
+    ``status`` for this same turn inside the refresh window does not send a
+    second indicator. A new message does.
     """
     indicators = typing or TypingIndicators()
+    pending: set[asyncio.Task[None]] = set()
+
+    def _soon(coro: Coroutine[Any, Any, None]) -> None:
+        task = asyncio.create_task(coro)
+        pending.add(task)
+        task.add_done_callback(pending.discard)
 
     async def _relay(message: InboundMessage) -> None:
         message_key = str(message.timestamp_ms)
         if indicators.try_acquire(message.chat_id, message_key):
-            await send_typing_start(signal_client, indicators, message.chat_id)
+            ticket = indicators.current_ticket(message.chat_id)
+            if ticket is not None:
+                _soon(send_typing_start(signal_client, indicators, message.chat_id, ticket))
+                # One loop turn so the RPC is actually in flight, without
+                # waiting for signal-cli to answer.
+                await asyncio.sleep(0)
 
         try:
             await signal_client.send_reaction(
@@ -86,6 +101,9 @@ def _make_inbound_handler(
                 "inbound message not relayed to worker",
                 extra={"user_id": message.user_id, "chat_id": message.chat_id},
             )
+            # No complete/error will arrive to clear the indicator.
+            indicators.cancel_chat(message.chat_id)
+            _soon(send_typing_stop(signal_client, message.chat_id))
 
     return _relay
 

@@ -28,11 +28,15 @@ from fastapi import BackgroundTasks, FastAPI, Request, Response
 
 from bt_signal_gateway.config import Settings, get_settings
 from bt_signal_gateway.dedup import CompletedKeys
-from bt_signal_gateway.dispatch import CallbackPayload, dispatch_callback, parse_callback_payload
+from bt_signal_gateway.dispatch import (
+    CallbackPayload,
+    chat_id_for,
+    dispatch_callback,
+    parse_callback_payload,
+)
 from bt_signal_gateway.signal_client import SignalClient
 from bt_signal_gateway.typing_indicator import (
     TypingIndicators,
-    chat_id_for,
     send_typing_start,
     send_typing_stop,
 )
@@ -163,19 +167,18 @@ def create_app(
         # status carries no chat text. It refreshes Signal's native typing
         # indicator for the chat (group ``chat_id``, otherwise the DM
         # ``user_id``) and never becomes a message. progress still relays
-        # intermediate text. complete/error are terminal: the turn is marked
-        # finished before the response returns, so a late status cannot
-        # restart the indicator while delivery is still queued.
+        # intermediate text. complete/error are terminal, but only once we
+        # know a client can deliver: marking the turn finished before that
+        # check would answer 503 and still swallow a later status.
         typing: TypingIndicators = app.state.typing
         chat_id = chat_id_for(user_id=payload.user_id, chat_id=payload.chat_id)
-        stop_typing = payload.type in ("complete", "error") and typing.finish(
-            chat_id, payload.message_key
-        )
 
         if payload.type == "status":
             signal_client: SignalClient | None = app.state.signal_client
             if signal_client is not None and typing.try_acquire(chat_id, payload.message_key):
-                background.add_task(send_typing_start, signal_client, typing, chat_id)
+                ticket = typing.current_ticket(chat_id)
+                if ticket is not None:
+                    background.add_task(send_typing_start, signal_client, typing, chat_id, ticket)
             return Response(status_code=200)
 
         signal_client = app.state.signal_client
@@ -185,6 +188,14 @@ def create_app(
                 extra={"message_key": payload.message_key, "type": payload.type},
             )
             return Response(status_code=503)
+
+        # Mark the turn finished before the response returns, so a late status
+        # cannot restart the indicator while delivery is still queued. This is
+        # the first accepted complete/error, not a successful Signal send: a
+        # retry may redeliver the text, but it must not bring typing back.
+        stop_typing = payload.type in ("complete", "error") and typing.finish(
+            chat_id, payload.message_key
+        )
 
         # progress/error: fire-and-forget, not deduped. progress streams an
         # intermediate update as a new message; error sends the fallback. Only

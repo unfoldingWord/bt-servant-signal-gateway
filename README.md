@@ -372,8 +372,9 @@ callback transport currently enqueues rather than 429-ing, so this is defensive.
 equal `ENGINE_API_KEY`; a missing/wrong token gets `401`). Payloads are typed `status` /
 `progress` / `complete` / `error`. The gateway acks quickly and delivers off the ack path, so a
 slow signal-cli send never blocks the worker's webhook. `status` (no chat text) is acked and
-refreshes signal-cli's `sendTyping` indicator for that chat — at most once every 10 seconds, the
-cadence Signal uses to keep its ~15 second indicator visible — and never becomes a message. On
+refreshes signal-cli's `sendTyping` indicator for that chat — at most once every 10 seconds for the
+same turn, the cadence Signal uses to keep its ~15 second indicator visible; a new message in that
+chat starts it immediately — and never becomes a message. On
 `complete` or `error` the gateway sends `sendTyping` with `stop: true`, and a later `status` for
 that `message_key` does not start it again. `progress` splits its intermediate `text` at
 `CHUNK_SIZE` and sends each chunk as a **new** message

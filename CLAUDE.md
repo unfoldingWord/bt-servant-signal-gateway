@@ -68,8 +68,9 @@ Much of `signal_client.py` / `signal_listener.py` / `envelope.py` is ported from
   `X-Engine-Token` header. `progress` is fire-and-forget; only the terminal `complete` is deduped on
   `message_key` (the worker does not retry idempotently). A 👀 reaction acks inbound receipt and is
   replaced by ✅/❌ on the terminal callback. `status` refreshes signal-cli `sendTyping` (no chat
-  message, at most once per 10 seconds per chat). `complete` / `error` send `sendTyping` with
-  `stop: true`. The typing indicator also starts when the user's message arrives.
+  message, at most once per 10 seconds for the same turn; a new message in that chat starts it
+  immediately). `complete` / `error` send `sendTyping` with `stop: true`. The typing indicator also
+  starts when the user's message arrives.
 - The worker is channel-neutral; **no worker changes are needed** for Signal.
 
 ## Coding Standards

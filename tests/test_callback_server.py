@@ -43,6 +43,8 @@ class _FakeSignalClient:
         self.sends: list[tuple[str, str]] = []
         self.reactions: list[tuple[str, str, str, int]] = []
         self.typing: list[tuple[str, bool]] = []
+        # "send" for a chat message, "start"/"stop" for the typing indicator.
+        self.events: list[str] = []
         self._results = list(results) if results is not None else None
         self._typing_raises = typing_raises
         self._typing_ok = typing_ok
@@ -54,6 +56,7 @@ class _FakeSignalClient:
         attachments: list[str] | None = None,
         text_styles: list[str] | None = None,
     ) -> bool:
+        self.events.append("send")
         self.sends.append((chat_id, message))
         if self._results is None:
             return True
@@ -66,6 +69,7 @@ class _FakeSignalClient:
         return True
 
     async def send_typing(self, chat_id: str, *, stop: bool = False) -> bool:
+        self.events.append("stop" if stop else "start")
         self.typing.append((chat_id, stop))
         if self._typing_raises:
             raise RuntimeError("typing rpc down")
@@ -162,12 +166,21 @@ def test_error_sends_fallback() -> None:
     assert fake.sends[0][0] == USER_ID
 
 
+def _assert_message_before_stop(fake: _FakeSignalClient) -> None:
+    """The chat message is handed to signal-cli before sendTyping(stop=True)."""
+    assert "send" in fake.events
+    stop_at = fake.events.index("stop")
+    assert "send" in fake.events[:stop_at]
+    assert "send" not in fake.events[stop_at + 1 :]
+
+
 def test_status_is_acked_without_sending() -> None:
     fake, client = _client()
     body = {"type": "status", "user_id": USER_ID, "message_key": "k1", "text": "..."}
     resp = _post(client, body)
     assert resp.status_code == 200
     assert fake.sends == []
+    assert fake.typing == [(USER_ID, False)]
 
 
 def test_status_shows_typing_for_the_dm_and_sends_no_message() -> None:
@@ -199,6 +212,23 @@ def test_status_typing_is_throttled_to_once_per_ten_seconds() -> None:
 
     clock["now"] = 1_010.0
     assert _post(client, body).status_code == 200
+    assert fake.typing == [(USER_ID, False), (USER_ID, False)]
+
+
+def test_a_new_turn_bypasses_the_ten_second_throttle() -> None:
+    # The 10s gap is per turn. A second question in the same chat must still
+    # show "typing…" immediately; only repeats of the same message_key wait.
+    clock = {"now": 1_000.0}
+    fake, client = _client(now=lambda: clock["now"])
+    first = {"type": "status", "user_id": USER_ID, "message_key": "k1", "text": "working"}
+    second = {"type": "status", "user_id": USER_ID, "message_key": "k2", "text": "next"}
+
+    assert _post(client, first).status_code == 200
+    clock["now"] = 1_001.0
+    assert _post(client, second).status_code == 200
+    assert fake.typing == [(USER_ID, False), (USER_ID, False)]
+
+    assert _post(client, second).status_code == 200
     assert fake.typing == [(USER_ID, False), (USER_ID, False)]
 
 
@@ -236,6 +266,7 @@ def test_complete_stops_typing_and_a_late_status_does_not_restart_it() -> None:
     assert _post(client, _complete_body()).status_code == 200
     assert fake.sends == [(USER_ID, "hello there")]
     assert fake.typing == [(USER_ID, True)]
+    _assert_message_before_stop(fake)
 
     late = {"type": "status", "user_id": USER_ID, "message_key": "k1", "text": "still working"}
     assert _post(client, late).status_code == 200
@@ -250,6 +281,7 @@ def test_error_stops_typing_and_a_late_status_does_not_restart_it() -> None:
     assert len(fake.sends) == 1
     assert fake.sends[0][0] == USER_ID
     assert fake.typing == [(USER_ID, True)]
+    _assert_message_before_stop(fake)
 
     late = {"type": "status", "user_id": USER_ID, "message_key": "k1"}
     assert _post(client, late).status_code == 200
@@ -302,6 +334,57 @@ def test_failed_typing_is_logged_and_does_not_break_the_callback(
         assert _post(client, _complete_body()).status_code == 200
     assert fake.sends == [(USER_ID, "hello there")]
     assert any("typing indicator failed" in record.message for record in caplog.records)
+
+
+def test_terminal_without_a_signal_client_does_not_finish_the_turn() -> None:
+    # finish() must not run before we know we can deliver. A 503 leaves the
+    # turn open so a later status, once a client exists, can still show typing.
+    typing = TypingIndicators()
+    unavailable = TestClient(create_app(settings=_settings(), typing=typing))
+    for body in (_complete_body("k1"), {"type": "error", "user_id": USER_ID, "message_key": "k1"}):
+        assert _post(unavailable, body).status_code == 503
+
+    fake = _FakeSignalClient()
+    ready = TestClient(
+        create_app(
+            signal_client=cast(SignalClient, fake),
+            settings=_settings(),
+            typing=typing,
+        )
+    )
+    status = {"type": "status", "user_id": USER_ID, "message_key": "k1", "text": "still open"}
+    assert _post(ready, status).status_code == 200
+    assert fake.sends == []
+    assert fake.typing == [(USER_ID, False)]
+
+
+def test_failed_complete_stops_typing_and_a_late_status_stays_dark() -> None:
+    # The turn ends when the first complete is accepted, not when Signal
+    # accepts the message. A retry can redeliver the text, but it must not
+    # bring the indicator back, and neither may a status that arrives meanwhile.
+    fake, client = _client(results=[False, True])
+    assert _post(client, _complete_body("retry")).status_code == 200
+    assert fake.sends == [(USER_ID, "hello there")]
+    assert fake.typing == [(USER_ID, True)]
+
+    late = {"type": "status", "user_id": USER_ID, "message_key": "retry", "text": "still working"}
+    assert _post(client, late).status_code == 200
+    assert fake.typing == [(USER_ID, True)]
+
+    assert _post(client, _complete_body("retry")).status_code == 200
+    assert fake.sends == [(USER_ID, "hello there"), (USER_ID, "hello there")]
+    assert fake.typing == [(USER_ID, True)]
+
+
+def test_finished_turns_drop_the_oldest_past_the_cap() -> None:
+    typing = TypingIndicators(finished_cap=2)
+    assert typing.finish("chat", "k1") is True
+    assert typing.finish("chat", "k2") is True
+    assert typing.finish("chat", "k3") is True
+    # k1 was evicted; k2 and k3 are still finished and must not restart.
+    assert typing.try_acquire("chat", "k2") is False
+    assert typing.try_acquire("chat", "k3") is False
+    assert typing.try_acquire("chat", "k1") is True
 
 
 def test_failed_typing_start_can_be_retried() -> None:

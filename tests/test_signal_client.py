@@ -57,7 +57,9 @@ class FakeDaemon:
         payload = json.loads(request.content)
         self.requests.append(payload)
         spec = self._next(payload["method"])
-        body = {"jsonrpc": "2.0", "id": payload.get("id")}
+        body: dict = {"jsonrpc": "2.0", "id": payload.get("id")}
+        if spec.get("omit_result"):
+            return httpx.Response(200, json=body)
         if "error" in spec:
             body["error"] = spec["error"]
         else:
@@ -446,3 +448,20 @@ async def test_send_typing_null_result_is_success() -> None:
     daemon.script("sendTyping", {"result": None})
     client = _make_client(daemon)
     assert await client.send_typing(PEER_UUID) is True
+
+
+async def test_send_typing_omitted_result_is_success() -> None:
+    # JsonRpcResponse marks result @JsonInclude(NON_NULL), so a null success
+    # payload is serialized with no result key and no error key.
+    daemon = FakeDaemon()
+    daemon.script("sendTyping", {"omit_result": True})
+    client = _make_client(daemon)
+    assert await client.send_typing(PEER) is True
+
+
+async def test_send_omitted_result_is_still_a_failure() -> None:
+    # Only void methods opt into "no error means success". send must not.
+    daemon = FakeDaemon()
+    daemon.script("send", {"omit_result": True})
+    client = _make_client(daemon)
+    assert await client.send(PEER, "hello") is False

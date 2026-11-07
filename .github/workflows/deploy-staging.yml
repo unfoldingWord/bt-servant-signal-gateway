@@ -8,15 +8,19 @@ name: Deploy Staging
 # just recreate it.
 #
 # Until staging gets its own registered number, this workflow is MANUAL-ONLY
-# (`workflow_dispatch`) — it no longer auto-fires on every green CI run on main. To
-# re-enable auto-deploy, restore the `workflow_run` trigger below and the
-# `if: ...conclusion == 'success'` guard on the job.
+# (`workflow_dispatch`). Branching model: staging follows `develop` (the integration
+# branch), so dispatch it on develop: `gh workflow run deploy-staging.yml --ref develop`.
+#
+# To re-enable auto-deploy, restore the `workflow_run` trigger below and the job `if:`
+# guard. The guard must check BOTH conclusion and event: a release PR (develop → main)
+# also runs CI with head branch `develop`, so without `event == 'push'` every merge into
+# develop would deploy staging twice.
 #
 # on:
 #   workflow_run:
 #     workflows: [CI]
 #     types: [completed]
-#     branches: [main]
+#     branches: [develop]
 on:
   workflow_dispatch:
 
@@ -24,7 +28,7 @@ jobs:
   deploy-staging:
     name: Deploy to Staging
     # Re-add when restoring auto-deploy:
-    # if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    # if: ${{ github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' }}
     runs-on: ubuntu-latest
     environment: staging
     concurrency:

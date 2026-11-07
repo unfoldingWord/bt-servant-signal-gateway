@@ -35,7 +35,7 @@ wheels = [
 
 [[package]]
 name = "bt-servant-signal-gateway"
-version = "0.7.4"
+version = "0.7.5"
 source = { editable = "." }
 dependencies = [
     { name = "fastapi" },
@@ -50,6 +50,7 @@ dev = [
     { name = "pre-commit" },
     { name = "pytest" },
     { name = "pytest-asyncio" },
+    { name = "pyyaml" },
     { name = "ruff" },
     { name = "ty" },
 ]
@@ -68,6 +69,7 @@ dev = [
     { name = "pre-commit", specifier = ">=3.7" },
     { name = "pytest", specifier = ">=8" },
     { name = "pytest-asyncio", specifier = ">=0.23" },
+    { name = "pyyaml", specifier = ">=6" },
     { name = "ruff", specifier = ">=0.6" },
     { name = "ty", specifier = ">=0.0.1a1" },
 ]

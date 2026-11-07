@@ -195,8 +195,14 @@ All infrastructure lives under the **unfoldingWord** Fly org, never a personal a
 
 | Workflow | Trigger | Target |
 |---|---|---|
-| `deploy-staging.yml` | **manual `workflow_dispatch` only** (auto-deploy on green CI disabled until staging has a registered Signal number — see [Staging's account](#one-time-fly-setup-unfoldingword-org)) | `bt-servant-signal-gateway-staging` |
-| `deploy.yml` | manual `workflow_dispatch` (+ a guard that refuses a commit whose CI isn't green) | `bt-servant-signal-gateway` |
+| `ci.yml` | push / PR on `develop` and `main` (lint, typecheck, test, lockfile; `Release Source` on PRs into `main`) | — |
+| `deploy-staging.yml` | **manual `workflow_dispatch` only**, dispatched on `develop` (auto-deploy on green CI disabled until staging has a registered Signal number — see [Staging's account](#one-time-fly-setup-unfoldingword-org)) | `bt-servant-signal-gateway-staging` |
+| `deploy.yml` | manual `workflow_dispatch` **on a `v*` release tag that is on `main`** (+ a guard that refuses a commit whose CI isn't green) | `bt-servant-signal-gateway` |
+
+Branching: `develop` is the integration branch (every feature PR targets it); `main` is the
+release branch and only receives `develop` (a release PR) or `hotfix/*`. Production deploys
+from a `v<version>` tag on `main`: `gh workflow run deploy.yml --ref v<version>`. See
+CLAUDE.md "Branching Model".
 
 Both authenticate via a `FLY_API_TOKEN` secret and run `flyctl deploy`. The workflows are scoped
 to GitHub **Environments** (`staging` / `production`), each holding its own **app-scoped**
@@ -252,8 +258,9 @@ fly deploy --app bt-servant-signal-gateway       # first deploy (or let the work
 > Instead, do one of:
 >
 > - **Don't keep staging running** — `fly machine destroy` it when idle (staging is only a
->   deploy/health target). ⚠️ note `deploy-staging.yml` **recreates it on the next green CI on
->   `main`**, so to stop it permanently also disable that workflow or make staging gateway-only.
+>   deploy/health target). ⚠️ note any run of `deploy-staging.yml` (manual-only today) **recreates
+>   it**, and re-enabling its auto-deploy on green CI on `develop` would recreate it on every
+>   merge — so to stop it permanently, keep that workflow manual or make staging gateway-only.
 > - **Run staging gateway-only** — gate the `signal-cli` supervisord program off on staging
 >   (no daemon → no loop, `/health` still works). *(durable fix — not yet implemented; see the
 >   tracking issue.)*

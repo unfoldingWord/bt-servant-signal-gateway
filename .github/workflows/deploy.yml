@@ -1,9 +1,13 @@
 name: Deploy Production
 
 # Production is manual (workflow_dispatch). Unlike a CF Worker, this is an always-on
-# stateful Machine, so we don't auto-deploy prod on every merge. The guard step below
-# refuses to deploy a commit whose CI isn't green — giving the manual path the same "never
-# deploy red" guarantee that staging gets structurally from `workflow_run`.
+# stateful Machine, so we don't auto-deploy prod on every merge.
+#
+# Branching model: production only ever runs a release, i.e. a v* tag cut on main after a
+# develop → main (or hotfix/*) merge. Dispatch it on the tag:
+#   gh workflow run deploy.yml --ref v<version>
+# Two guards run before anything is deployed: the tag must be a v* tag on main, and CI must
+# be green on that commit (the "never deploy red" guarantee).
 on:
   workflow_dispatch:
 
@@ -17,6 +21,28 @@ jobs:
       cancel-in-progress: false
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Full history so the guard below can check the tag is on main.
+          fetch-depth: 0
+
+      # workflow_dispatch accepts any ref, so refuse a branch, or a tag that never
+      # reached main, before anything is deployed.
+      - name: Require a release tag on main
+        run: |
+          set -euo pipefail
+          echo "Dispatched on $GITHUB_REF ($GITHUB_SHA)"
+          case "$GITHUB_REF" in
+            refs/tags/v*) ;;
+            *)
+              echo "::error::Production deploys only from a v* release tag. Re-run with: gh workflow run deploy.yml --ref v<version>"
+              exit 1 ;;
+          esac
+          git fetch --no-tags origin main
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "::error::Tag ${GITHUB_REF#refs/tags/} points at $GITHUB_SHA, which is not on main. Tag the release commit on main."
+            exit 1
+          fi
+          echo "ok: ${GITHUB_REF#refs/tags/} is on main"
 
       - name: Require CI green on this commit
         env:

@@ -1,5 +1,71 @@
 # Claude Instructions - bt-servant-signal-gateway
 
+## CRITICAL: Branching Model (develop → main)
+
+Two long-lived branches, since 2026-11:
+
+- **`develop`** is the integration branch and the default branch. Every feature branch and
+  every PR targets `develop`. Bot review plus CI is enough to merge there.
+- **`main`** is the release branch. It only ever receives `develop` (a release PR, "Release
+  vX.Y.Z: develop → main") or a `hotfix/*` branch. Only the repo owner can merge to `main`
+  (branch protection restricts pushes and requires a code-owner review, see
+  `.github/CODEOWNERS`). Production deploys from `main` by tag.
+- **Rule: `develop` is always releasable.** Work that is not ready to ship stays on its
+  feature branch, or merges behind a flag that is off in production. Never cherry-pick into
+  `main`; if something on `develop` must not ship, revert it on `develop` or flag it off, then
+  release.
+- **Hotfix:** branch from `main` as `hotfix/<name>`, PR into `main`, then open a PR from
+  `main` into `develop` the same day so `develop` stays ahead of `main`.
+- **Release:** merge the release PR, tag `v<version>` on the resulting `main` commit, then
+  dispatch the production deploy on that tag: `gh workflow run deploy.yml --ref v<version>`.
+- **Merge methods:** feature PRs into `develop` are **squash**-merged (`develop` requires
+  linear history). Release and hotfix PRs into `main` use a **merge commit**, never squash or
+  rebase. A squash would copy `develop`'s work into a new commit that `develop` never
+  contains, so the branches would diverge and every later release PR would re-list
+  already-shipped commits. With merge commits, the next release PR shows only what is new, and
+  `git log --first-parent main` lists one commit per release. Never delete `develop` when
+  merging a release PR.
+- **Up to date before merge:** `develop` requires a PR branch to be current with `develop`
+  before it merges ("Update branch"), so two PRs that pass alone cannot break together. `main`
+  does not, because `develop` never contains `main`'s release merge commits.
+
+CI's `Release Source` job refuses a PR into `main` from any other branch. The production
+deploy (`deploy.yml`) refuses to run on anything but a `v*` tag that is on `main`, and also
+refuses a commit whose CI isn't green.
+
+## CRITICAL: Ask Before Pushing
+
+**ALWAYS ask the user before pushing changes.** Always create a feature branch and a PR
+against `develop`; never push to `develop` or `main` directly.
+
+## CRITICAL: Never Deploy Directly
+
+**NEVER run `fly deploy` / `flyctl deploy` directly.** All deploys go through the GitHub
+Actions workflows:
+
+1. Commit, push a feature branch, open a PR against `develop`, wait for CI, get approval, merge.
+2. **Staging is deployed manually** (`deploy-staging.yml` is `workflow_dispatch` only — staging
+   has no registered Signal number, so auto-deploy is deliberately disabled; see the README
+   "Staging's account"). Dispatch it on `develop`: `gh workflow run deploy-staging.yml --ref develop`.
+3. **Production:** the owner merges a release PR (`develop` → `main`), tags `v<version>` on
+   `main`, and dispatches `deploy.yml` on that tag.
+
+The ONLY exception is if the user explicitly asks for a direct deploy (emergency hotfix).
+
+## Version Bumping and Release Tags
+
+Every PR bumps the version in `pyproject.toml` (patch for fixes/docs/CI, minor for new
+behavior) and refreshes `uv.lock` with `uv lock` so the lockfile check stays green. Feature
+PRs into `develop` are not tagged. After a release PR (`develop` → `main`) merges, tag the
+release on `main`:
+
+```bash
+git checkout main && git pull
+git tag v<version> && git push --tags
+```
+
+Tags are created on `main` after a release merge, never on `develop`.
+
 ## System Context
 
 **BT Servant** is an AI-powered Bible translation assistant developed by unfoldingWord. The

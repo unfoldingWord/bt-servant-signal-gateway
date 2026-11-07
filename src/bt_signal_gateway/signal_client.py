@@ -3,8 +3,8 @@
 A standalone async client for the local ``signal-cli`` daemon's HTTP mode,
 speaking JSON-RPC 2.0 at ``{SIGNAL_HTTP_URL}/api/v1/rpc``. Ported and trimmed
 from ``../hermes-agent/gateway/platforms/signal.py`` — only the outbound RPC
-surface (send, reactions, contacts, attachments) is kept; the inbound SSE
-listener, on-disk caching, and typing indicators live elsewhere.
+surface (send, reactions, contacts, attachments, typing indicators) is kept;
+the inbound SSE listener and on-disk caching live elsewhere.
 
 Recipient convention (shared with the inbound envelope layer): a direct chat is
 a raw phone number or Signal service ID; a group is the string
@@ -256,13 +256,18 @@ class SignalClient:
         log_failures: bool = True,
         raise_on_rate_limit: bool = False,
         rpc_timeout: float = 30.0,
+        none_result_ok: bool = False,
     ) -> Any:
         """Send a JSON-RPC 2.0 request to the signal-cli daemon.
 
         Returns the ``result`` payload, or ``None`` on any error. When
         ``raise_on_rate_limit=True``, a Signal ``[429]`` / ``RateLimitException``
         response raises :class:`SignalRateLimitError` instead of returning
-        ``None`` — lets the attachment path opt into backoff-retry.
+        ``None`` — lets the attachment path opt into backoff-retry. When
+        ``none_result_ok=True``, a present JSON ``null`` result — or a body
+        with no ``result`` key and no ``error`` — counts as success. signal-cli
+        marks ``result`` ``@JsonInclude(NON_NULL)``, so a null success payload
+        is omitted entirely (void methods such as ``sendTyping``).
         """
         rpc_id = f"{method}_{int(time.time() * 1000)}"
         payload = {
@@ -293,7 +298,14 @@ class SignalClient:
                     logger.debug("signal rpc error", extra={"method": method, "error": err})
                 return None
 
-            return data.get("result")
+            result = data.get("result")
+            # Void RPCs such as sendTyping may reply with JSON null, or omit
+            # result: signal-cli serializes a null success with no result key
+            # and no error key. Other methods still treat a missing result as
+            # failure.
+            if result is None and none_result_ok and "error" not in data:
+                return True
+            return result
 
         except SignalRateLimitError:
             raise
@@ -533,6 +545,25 @@ class SignalClient:
             )
         except Exception as exc:  # informational only — never fail the send
             logger.warning("signal: failed to send pacing notice", extra={"error": str(exc)})
+
+    # ------------------------------------------------------------------
+    # Typing indicator
+    # ------------------------------------------------------------------
+
+    async def send_typing(self, chat_id: str, *, stop: bool = False) -> bool:
+        """Show or clear the native Signal typing indicator.
+
+        JSON-RPC ``sendTyping`` on the local signal-cli daemon. A direct chat
+        sets ``recipient``; a ``group:<id>`` chat sets ``groupId``. ``stop``
+        sends the STOP action, which clears the indicator immediately.
+        Otherwise the recipient shows "typing…" for about 15 seconds.
+
+        Returns False when the RPC fails. Does not raise.
+        """
+        params: dict[str, Any] = {"account": self._account, "stop": stop}
+        await self._apply_destination(params, chat_id)
+        result = await self._rpc("sendTyping", params, none_result_ok=True)
+        return result is not None
 
     # ------------------------------------------------------------------
     # Reactions (progress indicators)

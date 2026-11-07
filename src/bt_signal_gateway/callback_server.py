@@ -14,10 +14,25 @@ running. A failed/partial send leaves the key neither completed nor in-flight,
 so a repeated callback is free to re-deliver the reply rather than being
 silently dropped.
 
-Dependencies (``signal_client``, ``settings``, ``dedup``) are injected into
-:func:`create_app` and stashed on ``app.state``. The module-level ``app`` keeps
-the no-arg form working for the ``/health`` smoke test; the entrypoint
-(``app.py``) constructs the app with real dependencies.
+That dedup mark is not "the turn is finished" for typing. ``typing.finish()``
+runs when the first ``complete`` or ``error`` is accepted — after the Signal
+client check, before the HTTP response, and before delivery. A late ``status``
+must not restart the indicator while the reply is queued, in flight, or being
+retried. The text of a failed ``complete`` stays re-deliverable; the indicator
+means the worker is still on that turn, so it stays off for that ``message_key``
+once the terminal callback is accepted. Stop itself is sent only when no later
+turn in the chat is still open: Signal has one indicator per conversation, and
+moving ``finish()`` into ``_deliver_and_mark`` would let a ``status`` during the
+retry light it up again.
+
+Dependencies (``signal_client``, ``settings``, ``dedup``, ``typing``) are
+injected into :func:`create_app` and stashed on ``app.state``. The module-level
+``app`` exists so ``/health`` can be imported with no arguments. It builds its
+own ``TypingIndicators``, which nothing else shares. Only
+``python -m bt_signal_gateway`` creates one gate and passes it to both the
+inbound listener and the callback app. Serving ``callback_server:app`` under
+uvicorn does not share that gate, so inbound and ``status`` would throttle
+separately.
 """
 
 from __future__ import annotations
@@ -28,8 +43,18 @@ from fastapi import BackgroundTasks, FastAPI, Request, Response
 
 from bt_signal_gateway.config import Settings, get_settings
 from bt_signal_gateway.dedup import CompletedKeys
-from bt_signal_gateway.dispatch import CallbackPayload, dispatch_callback, parse_callback_payload
+from bt_signal_gateway.dispatch import (
+    CallbackPayload,
+    chat_id_for,
+    dispatch_callback,
+    parse_callback_payload,
+)
 from bt_signal_gateway.signal_client import SignalClient
+from bt_signal_gateway.typing_indicator import (
+    TypingIndicators,
+    send_typing_start,
+    send_typing_stop,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -68,11 +93,51 @@ async def _deliver_and_mark(
     in_flight.discard(key)
 
 
+async def _dispatch_then_stop_typing(
+    payload: CallbackPayload,
+    signal_client: SignalClient,
+    settings: Settings,
+    chat_id: str,
+    *,
+    stop: bool,
+) -> None:
+    """Deliver an ``error`` callback, then clear the typing indicator.
+
+    The stop runs after the fallback message so a slow typing RPC cannot delay
+    the reply. It runs even when delivery raises, and its own failure is logged
+    inside :func:`send_typing_stop` rather than failing the callback.
+    """
+    try:
+        await dispatch_callback(payload, signal_client, settings)
+    finally:
+        if stop:
+            await send_typing_stop(signal_client, chat_id)
+
+
+async def _deliver_and_mark_then_stop_typing(
+    payload: CallbackPayload,
+    signal_client: SignalClient,
+    settings: Settings,
+    dedup: CompletedKeys,
+    in_flight: set[str],
+    chat_id: str,
+    *,
+    stop: bool,
+) -> None:
+    """Deliver a ``complete`` callback, then clear the typing indicator."""
+    try:
+        await _deliver_and_mark(payload, signal_client, settings, dedup, in_flight)
+    finally:
+        if stop:
+            await send_typing_stop(signal_client, chat_id)
+
+
 def create_app(
     *,
     signal_client: SignalClient | None = None,
     settings: Settings | None = None,
     dedup: CompletedKeys | None = None,
+    typing: TypingIndicators | None = None,
 ) -> FastAPI:
     """Build the FastAPI application, optionally with injected dependencies.
 
@@ -87,6 +152,7 @@ def create_app(
     app.state.dedup = dedup or CompletedKeys(ttl_ms=_DEDUP_TTL_MS)
     # message_keys whose delivery is currently running (blocks concurrent dupes).
     app.state.in_flight = set()
+    app.state.typing = typing or TypingIndicators()
 
     @app.get("/health")
     async def health() -> dict[str, object]:
@@ -113,12 +179,24 @@ def create_app(
             logger.warning("callback: rejected (unrecognized payload)", extra={"body_keys": keys})
             return Response(status_code=400)
 
-        # status carries no text — ack and drop. (progress carries intermediate
-        # text we relay as a new message; complete/error are terminal.)
+        # status carries no chat text. It refreshes Signal's native typing
+        # indicator for the chat (group ``chat_id``, otherwise the DM
+        # ``user_id``) and never becomes a message. progress still relays
+        # intermediate text. complete/error are terminal, but only once we
+        # know a client can deliver: marking the turn finished before that
+        # check would answer 503 and still swallow a later status.
+        typing: TypingIndicators = app.state.typing
+        chat_id = chat_id_for(user_id=payload.user_id, chat_id=payload.chat_id)
+
         if payload.type == "status":
+            signal_client: SignalClient | None = app.state.signal_client
+            if signal_client is not None and typing.try_acquire(chat_id, payload.message_key):
+                ticket = typing.current_ticket(chat_id)
+                if ticket is not None:
+                    background.add_task(send_typing_start, signal_client, typing, chat_id, ticket)
             return Response(status_code=200)
 
-        signal_client: SignalClient | None = app.state.signal_client
+        signal_client = app.state.signal_client
         if signal_client is None:
             logger.error(
                 "callback: no signal client configured; cannot deliver",
@@ -126,16 +204,41 @@ def create_app(
             )
             return Response(status_code=503)
 
+        # Mark the turn finished before the response returns, so a late status
+        # cannot restart the indicator while delivery is still queued. This is
+        # the first accepted complete/error, not a successful Signal send: a
+        # retry may redeliver the text, but it must not bring typing back.
+        # finish() is false when a later turn in this chat is still open, so
+        # that turn keeps the one indicator until it finishes too.
+        stop_typing = payload.type in ("complete", "error") and typing.finish(
+            chat_id, payload.message_key
+        )
+
         # progress/error: fire-and-forget, not deduped. progress streams an
         # intermediate update as a new message; error sends the fallback. Only
-        # the terminal `complete` is deduped (below).
-        if payload.type in ("progress", "error"):
+        # the terminal `complete` is deduped (below). Typing stops after the
+        # error fallback, not before, so the stop RPC cannot delay the message.
+        if payload.type == "error":
+            background.add_task(
+                _dispatch_then_stop_typing,
+                payload,
+                signal_client,
+                settings,
+                chat_id,
+                stop=stop_typing,
+            )
+            return Response(status_code=200)
+        if payload.type == "progress":
             background.add_task(dispatch_callback, payload, signal_client, settings)
             return Response(status_code=200)
 
-        # complete: dedup on message_key, marking done only after delivery
-        # succeeds (in _deliver_and_mark). is_completed covers finished replies;
-        # in_flight covers one that's still being delivered.
+        # complete: dedup on message_key. The key is marked *completed* only
+        # after delivery succeeds, inside _deliver_and_mark. That is the dedup
+        # mark, not the typing mark: typing.finish() already ran above, when
+        # this callback was accepted, so a late status stays dark during the
+        # send and during a retry. Do not move finish() down here.
+        # is_completed covers delivered replies; in_flight covers one that's
+        # still being delivered.
         dedup: CompletedKeys = app.state.dedup
         in_flight: set[str] = app.state.in_flight
         key = payload.message_key
@@ -148,7 +251,16 @@ def create_app(
 
         # Reserve before scheduling so a concurrent duplicate can't slip past.
         in_flight.add(key)
-        background.add_task(_deliver_and_mark, payload, signal_client, settings, dedup, in_flight)
+        background.add_task(
+            _deliver_and_mark_then_stop_typing,
+            payload,
+            signal_client,
+            settings,
+            dedup,
+            in_flight,
+            chat_id,
+            stop=stop_typing,
+        )
         return Response(status_code=200)
 
     return app

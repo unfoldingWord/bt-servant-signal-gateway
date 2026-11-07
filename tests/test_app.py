@@ -3,16 +3,20 @@
 from __future__ import annotations
 
 import asyncio
-from typing import cast
+from collections.abc import Coroutine
+from typing import Any, cast
 
 import pytest
+from fastapi.testclient import TestClient
 
 from bt_signal_gateway import app as app_module
+from bt_signal_gateway.callback_server import create_app
 from bt_signal_gateway.config import Settings, get_settings
 from bt_signal_gateway.engine_client import EngineClient
 from bt_signal_gateway.envelope import AttachmentRef, InboundMessage
 from bt_signal_gateway.media import InboundAudio
 from bt_signal_gateway.signal_client import SignalClient
+from bt_signal_gateway.typing_indicator import TypingIndicators, send_typing_start
 
 REQUIRED_ENV = {
     "SIGNAL_ACCOUNT": "+15551234567",
@@ -42,19 +46,33 @@ def _settings() -> Settings:
 
 
 class _FakeEngine:
-    def __init__(self) -> None:
+    def __init__(self, order: list[str] | None = None, *, accepted: bool = True) -> None:
         self.calls: list[InboundAudio | None] = []
+        self._order = order
+        self._accepted = accepted
 
     async def submit(self, _message: InboundMessage, *, audio: InboundAudio | None = None) -> bool:
+        if self._order is not None:
+            self._order.append("submit")
         self.calls.append(audio)
-        return True
+        return self._accepted
 
 
 class _FakeSignal:
-    def __init__(self, data: bytes | None = b"voice", *, reaction_raises: bool = False) -> None:
+    def __init__(
+        self,
+        data: bytes | None = b"voice",
+        *,
+        reaction_raises: bool = False,
+        typing_raises: bool = False,
+        order: list[str] | None = None,
+    ) -> None:
         self._data = data
         self._reaction_raises = reaction_raises
+        self._typing_raises = typing_raises
+        self._order = order
         self.reactions: list[tuple[str, str, str, int]] = []
+        self.typing: list[tuple[str, bool]] = []
 
     async def get_attachment(self, _attachment_id: str) -> bytes | None:
         return self._data
@@ -62,9 +80,19 @@ class _FakeSignal:
     async def send_reaction(
         self, chat_id: str, emoji: str, target_author: str, target_timestamp: int
     ) -> bool:
+        if self._order is not None:
+            self._order.append("reaction")
         if self._reaction_raises:
             raise RuntimeError("reaction rpc boom")
         self.reactions.append((chat_id, emoji, target_author, target_timestamp))
+        return True
+
+    async def send_typing(self, chat_id: str, *, stop: bool = False) -> bool:
+        if self._order is not None:
+            self._order.append("typing")
+        self.typing.append((chat_id, stop))
+        if self._typing_raises:
+            raise RuntimeError("typing rpc down")
         return True
 
 
@@ -113,6 +141,266 @@ async def test_inbound_handler_reacts_eyes_then_relays() -> None:
 
     assert signal.reactions == [(msg.chat_id, "👀", msg.user_id, msg.timestamp_ms)]
     assert engine.calls == [None]  # still relayed
+
+
+async def test_inbound_handler_shows_typing_before_relaying() -> None:
+    order: list[str] = []
+    engine = _FakeEngine(order)
+    signal = _FakeSignal(order=order)
+    handler = app_module._make_inbound_handler(
+        cast(EngineClient, engine), cast(SignalClient, signal), _settings()
+    )
+    msg = _message([])
+    await handler(msg)
+
+    assert signal.typing == [(msg.chat_id, False)]
+    assert engine.calls == [None]
+    assert order.index("typing") < order.index("submit")
+
+
+async def test_inbound_handler_shows_typing_in_a_group() -> None:
+    engine = _FakeEngine()
+    signal = _FakeSignal()
+    handler = app_module._make_inbound_handler(
+        cast(EngineClient, engine), cast(SignalClient, signal), _settings()
+    )
+    msg = InboundMessage(
+        user_id="u",
+        chat_id="group:abc",
+        text="hello",
+        timestamp_ms=1700000000000,
+        is_group=True,
+        group_id="abc",
+    )
+    await handler(msg)
+
+    assert signal.typing == [("group:abc", False)]
+    assert engine.calls == [None]
+
+
+def test_inbound_and_status_share_the_typing_throttle() -> None:
+    clock = {"now": 50.0}
+    typing = TypingIndicators(now=lambda: clock["now"])
+    engine = _FakeEngine()
+    signal = _FakeSignal()
+    handler = app_module._make_inbound_handler(
+        cast(EngineClient, engine),
+        cast(SignalClient, signal),
+        _settings(),
+        typing,
+    )
+    msg = _message([])
+
+    async def _show_typing() -> None:
+        await handler(msg)
+
+    asyncio.run(_show_typing())
+
+    app = create_app(signal_client=cast(SignalClient, signal), settings=_settings(), typing=typing)
+    client = TestClient(app)
+    body = {
+        "type": "status",
+        "user_id": msg.user_id,
+        "message_key": str(msg.timestamp_ms),
+        "text": "working",
+    }
+    headers = {"X-Engine-Token": "secret-token"}
+    response = client.post("/progress-callback", json=body, headers=headers)
+    assert response.status_code == 200
+    assert signal.typing == [(msg.chat_id, False)]
+
+    clock["now"] = 60.0
+    response = client.post("/progress-callback", json=body, headers=headers)
+    assert response.status_code == 200
+    assert signal.typing == [(msg.chat_id, False), (msg.chat_id, False)]
+
+
+async def test_second_inbound_refreshes_typing_inside_the_window() -> None:
+    clock = {"now": 20.0}
+    typing = TypingIndicators(now=lambda: clock["now"])
+    signal = _FakeSignal()
+    handler = app_module._make_inbound_handler(
+        cast(EngineClient, _FakeEngine()),
+        cast(SignalClient, signal),
+        _settings(),
+        typing,
+    )
+    await handler(_message([]))
+    clock["now"] = 21.0
+    await handler(
+        InboundMessage(user_id="u", chat_id="u", text="again", timestamp_ms=1700000000001)
+    )
+
+    assert signal.typing == [("u", False), ("u", False)]
+
+
+async def test_slow_typing_does_not_delay_the_relay() -> None:
+    release = asyncio.Event()
+    started = asyncio.Event()
+
+    class _SlowSignal(_FakeSignal):
+        async def send_typing(self, chat_id: str, *, stop: bool = False) -> bool:
+            self.typing.append((chat_id, stop))
+            if not stop:
+                started.set()
+                await release.wait()
+            return True
+
+    engine = _FakeEngine()
+    signal = _SlowSignal()
+    handler = app_module._make_inbound_handler(
+        cast(EngineClient, engine), cast(SignalClient, signal), _settings()
+    )
+    relay = asyncio.create_task(cast(Coroutine[Any, Any, None], handler(_message([]))))
+    await asyncio.wait_for(started.wait(), timeout=1)
+    await asyncio.wait_for(relay, timeout=1)
+    assert engine.calls == [None]
+    release.set()
+    await relay
+
+
+async def test_failed_relay_stops_typing() -> None:
+    engine = _FakeEngine(accepted=False)
+    signal = _FakeSignal()
+    handler = app_module._make_inbound_handler(
+        cast(EngineClient, engine), cast(SignalClient, signal), _settings()
+    )
+    await handler(_message([]))
+    await asyncio.sleep(0)
+
+    assert engine.calls == [None]
+    assert signal.typing[-1] == ("u", True)
+
+
+async def test_failed_relay_stops_typing_while_the_start_is_still_in_flight() -> None:
+    release = asyncio.Event()
+    started = asyncio.Event()
+
+    class _SlowSignal(_FakeSignal):
+        async def send_typing(self, chat_id: str, *, stop: bool = False) -> bool:
+            self.typing.append((chat_id, stop))
+            if not stop:
+                started.set()
+                await release.wait()
+            return True
+
+    engine = _FakeEngine(accepted=False)
+    signal = _SlowSignal()
+    handler = app_module._make_inbound_handler(
+        cast(EngineClient, engine), cast(SignalClient, signal), _settings()
+    )
+    relay = asyncio.create_task(cast(Coroutine[Any, Any, None], handler(_message([]))))
+    await asyncio.wait_for(started.wait(), timeout=1)
+    await asyncio.wait_for(relay, timeout=1)
+    await asyncio.sleep(0)
+    assert engine.calls == [None]
+    assert ("u", True) in signal.typing
+    release.set()
+    await asyncio.sleep(0)
+    assert signal.typing[-1] == ("u", True)
+
+
+async def test_in_flight_start_stops_if_the_turn_finishes_first() -> None:
+    release = asyncio.Event()
+    started = asyncio.Event()
+
+    class _SlowSignal:
+        def __init__(self) -> None:
+            self.typing: list[tuple[str, bool]] = []
+
+        async def send_typing(self, chat_id: str, *, stop: bool = False) -> bool:
+            self.typing.append((chat_id, stop))
+            if not stop:
+                started.set()
+                await release.wait()
+            return True
+
+    typing = TypingIndicators()
+    signal = _SlowSignal()
+    assert typing.try_acquire("u", "k1") is True
+    ticket = typing.current_ticket("u")
+    assert ticket is not None
+    task = asyncio.create_task(send_typing_start(cast(SignalClient, signal), typing, "u", ticket))
+    await asyncio.wait_for(started.wait(), timeout=1)
+    assert typing.finish("u", "k1") is True
+    release.set()
+    await task
+    assert signal.typing[-1] == ("u", True)
+
+
+async def test_older_in_flight_start_does_not_stop_when_its_turn_finishes_first() -> None:
+    # A's start is still in flight, B has started (its own start failed and
+    # released the ticket) and is not finished. Finishing A must not stop the
+    # chat: B is still open, even though the chat ticket is currently empty.
+    release = asyncio.Event()
+    started = asyncio.Event()
+
+    class _SlowSignal:
+        def __init__(self) -> None:
+            self.typing: list[tuple[str, bool]] = []
+
+        async def send_typing(self, chat_id: str, *, stop: bool = False) -> bool:
+            self.typing.append((chat_id, stop))
+            if not stop:
+                started.set()
+                await release.wait()
+            return True
+
+    typing = TypingIndicators()
+    signal = _SlowSignal()
+    assert typing.try_acquire("u", "A") is True
+    ticket = typing.current_ticket("u")
+    assert ticket is not None
+    task = asyncio.create_task(send_typing_start(cast(SignalClient, signal), typing, "u", ticket))
+    await asyncio.wait_for(started.wait(), timeout=1)
+    assert typing.try_acquire("u", "B") is True
+    newer = typing.current_ticket("u")
+    assert newer is not None
+    typing.release("u", newer)
+    assert typing.finish("u", "A") is False
+    release.set()
+    await task
+    assert signal.typing == [("u", False)]
+    assert typing.finish("u", "B") is True
+
+
+async def test_older_in_flight_start_does_not_stop_a_newer_turn() -> None:
+    release = asyncio.Event()
+    started = asyncio.Event()
+
+    class _SlowSignal:
+        def __init__(self) -> None:
+            self.typing: list[tuple[str, bool]] = []
+
+        async def send_typing(self, chat_id: str, *, stop: bool = False) -> bool:
+            self.typing.append((chat_id, stop))
+            if not stop:
+                started.set()
+                await release.wait()
+            return True
+
+    typing = TypingIndicators()
+    signal = _SlowSignal()
+    assert typing.try_acquire("u", "k1") is True
+    ticket = typing.current_ticket("u")
+    assert ticket is not None
+    task = asyncio.create_task(send_typing_start(cast(SignalClient, signal), typing, "u", ticket))
+    await asyncio.wait_for(started.wait(), timeout=1)
+    assert typing.try_acquire("u", "k2") is True
+    release.set()
+    await task
+    assert signal.typing == [("u", False)]
+
+
+async def test_inbound_handler_relays_even_if_typing_fails() -> None:
+    engine = _FakeEngine()
+    signal = _FakeSignal(typing_raises=True)
+    handler = app_module._make_inbound_handler(
+        cast(EngineClient, engine), cast(SignalClient, signal), _settings()
+    )
+    await handler(_message([]))
+
+    assert engine.calls == [None]
 
 
 async def test_inbound_handler_relays_even_if_reaction_fails() -> None:

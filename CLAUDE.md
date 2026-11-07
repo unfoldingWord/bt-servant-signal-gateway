@@ -107,7 +107,7 @@ src/bt_signal_gateway/
 ├── app.py            # async entrypoint: runs the SSE listener + the uvicorn callback server
 ├── config.py         # typed settings (pydantic-settings)
 ├── logging_config.py # logging setup
-├── signal_client.py  # signal-cli JSON-RPC client (send + voice notes/attachments, sendReaction, listContacts, getAttachment)
+├── signal_client.py  # signal-cli JSON-RPC client (send, sendTyping, voice notes/attachments, sendReaction, listContacts, getAttachment)
 ├── signal_listener.py# inbound SSE listener (reconnect/backoff)
 ├── signal_rate_limit.py # attachment-send pacing scheduler
 ├── envelope.py       # Signal envelope → normalized InboundMessage + filters (group + mention gating)
@@ -116,7 +116,8 @@ src/bt_signal_gateway/
 ├── dispatch.py       # progress/complete/error callback → chunk + send to Signal (text + media) + ✅/❌ react
 ├── media.py          # inbound audio encode + outbound media (voice/attachment) download
 ├── chunking.py       # split long replies at CHUNK_SIZE
-└── dedup.py          # in-memory TTL dedup on message_key
+├── dedup.py          # in-memory TTL dedup on message_key
+└── typing_indicator.py # per-chat typing refresh (10s) and stop on complete/error
 ```
 
 Much of `signal_client.py` / `signal_listener.py` / `envelope.py` is ported from
@@ -132,7 +133,10 @@ Much of `signal_client.py` / `signal_listener.py` / `envelope.py` is ported from
 - Worker → gateway: callbacks to `{GATEWAY_PUBLIC_URL}/progress-callback` guarded by the
   `X-Engine-Token` header. `progress` is fire-and-forget; only the terminal `complete` is deduped on
   `message_key` (the worker does not retry idempotently). A 👀 reaction acks inbound receipt and is
-  replaced by ✅/❌ on the terminal callback.
+  replaced by ✅/❌ on the terminal callback. `status` refreshes signal-cli `sendTyping` (no chat
+  message, at most once per 10 seconds for the same turn; a new message in that chat starts it
+  immediately). `complete` / `error` send `sendTyping` with `stop: true`. The typing indicator also
+  starts when the user's message arrives.
 - The worker is channel-neutral; **no worker changes are needed** for Signal.
 
 ## Coding Standards
